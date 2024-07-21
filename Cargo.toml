@@ -1,0 +1,18 @@
+[package]
+name = "swim-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.136", features = ["derive"] }
+serde_json = "1.0.79"
+if-addrs = "0.13.1"
+anyhow = { version = "1.0.56", features = ["backtrace"] }
+tokio = { version = "1.17.0", features = ["rt-multi-thread", "io-util", "macros", "net", "time"] }
+tokio-util = { version = "0.7.1", features = ["codec"] }
+log = "0.4"
+tracing-subscriber = "0.3.10"
+uuid = { version = "1.2.1", features = ["serde", "v4"] }
+env_logger = "0.11.3"
+async-trait = "0.1.81"
+gethostname = "0.5.0"
