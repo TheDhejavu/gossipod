@@ -1,10 +1,10 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use config::{SwimConfig, SwimConfigBuilder, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT};
 use ip_addr::IpAddress;
 use listener::SwimListener;
 use members::Members;
-use message::{Message, MessageType, NetMessage};
+use message::MessageBroker;
 use node::Node;
 use state::NodeState;
 use log::*;
@@ -22,6 +22,7 @@ mod state;
 mod node;
 mod members;
 mod listener;
+mod codec;
 
 /// # SWIM Protocol Implementation
 ///
@@ -40,21 +41,16 @@ enum SwimState {
     Stopped,
 }
 
-struct SwimInner  {
+pub(crate) struct SwimInner  {
     // the node configuration
     config: SwimConfig,
-
     // current members and their current state. every node maintains a map of information
     // about each nodes.
     members: Members,
-
     transport: Transport,
-    
     state: RwLock<SwimState>,
-    
     shutdown: broadcast::Sender<()>,
-
-    net_message: NetMessage,
+    pub(crate) message_broker: MessageBroker,
 }
 
 impl Clone for Swim {
@@ -78,21 +74,21 @@ impl Swim {
             Duration::from_millis(DEFAULT_TRANSPORT_TIMEOUT),
         );
 
-        let net_message = NetMessage::new(Box::new(transport.clone()));
+        let message_broker = MessageBroker::new(Box::new(transport.clone()));
 
         let swim = Self {
             inner: Arc::new(SwimInner {
                 config,
-                net_message,
+                message_broker,
                 members: Members::new(),
                 state: RwLock::new(SwimState::Idle),
-                shutdown: shutdown_tx,
+                shutdown: shutdown_tx.clone(),
                 transport,
             })
         };
 
         Self::spawn_listeners(
-            SwimListener::new(swim.clone(), transport_channel),
+            SwimListener::new(swim.clone(), transport_channel, shutdown_tx.clone()),
         ).await;
 
         Ok(swim)
@@ -189,113 +185,17 @@ impl Swim {
             listener.run_listeners().await 
         });
     }
-    // Handles each TCP request stream...
-    async fn handle_tcp_stream(&mut self, addr: SocketAddr, data: Vec<u8>) -> Result<()> {
-        let message = match String::from_utf8(data) {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!("[ERR] Failed to decode message from {}: {:?}", addr, e);
-                return Err(anyhow!(format!("failed to decode message from {}: {:?}", addr, e)));
-            }
-        };
-
-        match Message::from_json(&message) {
-            Ok(parsed_message) => {
-
-                info!("Received message from {}: {:?}", addr, parsed_message);
-                // Handle the UDP Message Types
-                match parsed_message.msg_type {
-                    MessageType::Ping => {
-                        info!("[MSG] Handling `PING` message with ID: {}", parsed_message.id);
-                        // self.inner.net_message.send_ping(sender, self);
-                    }
-                    MessageType::PingReq => {
-                        info!("MSG] Handling `PING_REQ` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Ack => {
-                        info!("MSG] Handling `ACK` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Leave => {
-                        info!("MSG] Handling `LEAVE` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Join => {
-                        info!("MSG] Handling `JOIN]` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Update => {
-                        info!("MSG] Handling `UPDATE` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Fail => {
-                        info!("MSG] Handling `FAIL` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::AppMsg => {
-                        info!("MSG] Handling `APP_MSG` message with ID: {}", parsed_message.id);
-                    }
-                }
-            }
-            Err(e) => {
-                error!("[ERR] Failed to parse message from {}: {:?}", addr, e);
-                return Err(anyhow!(format!("Failed to parse message from {}: {:?}", addr, e)));
-            }
-        };
-        Ok(())
-    }
+    
     pub async fn send_message(&mut self) -> Result<()> {
         let members = self.members().await?;
         for node in &members {
-            self.inner.net_message.send_ping(self.socket_addr().unwrap(), node.socket_addr().unwrap()).await?;
+            let sender = self.get_local_node().await?.socket_addr()?;
+            let target = node.socket_addr()?;
+            self.inner.message_broker.send_ping(sender, target).await?;
         }
         Ok(())
     }
-    // handle UDP message from packet
-    async fn handle_udp_packet(&mut self, addr: SocketAddr, data: Vec<u8>) -> Result<()>{
-        let message = match String::from_utf8(data) {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!("[ERR] Failed to decode message from {}: {:?}", addr, e);
-                return Err(anyhow!(format!("failed to decode message from {}: {:?}", addr, e)));
-            }
-        };
-
-        match Message::from_json(&message) {
-            Ok(parsed_message) => {
-
-                info!("Received message from {}: {:?}", addr, parsed_message);
-                // Handle the UDP Message Types
-                match parsed_message.msg_type {
-                    MessageType::Ping => {
-                        info!("[MSG] Handling `PING` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::PingReq => {
-                        info!("MSG] Handling `PING_REQ` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Ack => {
-                        info!("MSG] Handling `ACK` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Leave => {
-                        info!("MSG] Handling `LEAVE` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Join => {
-                        info!("MSG] Handling `JOIN]` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Update => {
-                        info!("MSG] Handling `UPDATE` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::Fail => {
-                        info!("MSG] Handling `FAIL` message with ID: {}", parsed_message.id);
-                    }
-                    MessageType::AppMsg => {
-                        info!("MSG] Handling `APP_MSG` message with ID: {}", parsed_message.id);
-                    }
-                }
-            }
-            Err(e) => {
-                error!("[ERR] Failed to parse message from {}: {:?}", addr, e);
-                return Err(anyhow!(format!("Failed to parse message from {}: {:?}", addr, e)));
-            }
-        };
-        Ok(())
-    }
-
+   
     pub async fn join(&self) -> Result<()> {
         panic!("unimplement join")
     }
@@ -305,8 +205,7 @@ impl Swim {
         let name = self.inner.config.name();
         let port = self.inner.config.port();
 
-        let node = Node::new(ip_addr, port)
-            .with_name(name)
+        let node = Node::new(ip_addr, port, name)
             .with_state(NodeState::Alive);
 
         self.inner.members.add_node(node)?;
@@ -314,9 +213,13 @@ impl Swim {
         Ok(())
     }
 
-    pub(crate) fn socket_addr(&self) -> Result<SocketAddr> {
-        let full_address = format!("{}:{}", self.inner.config.addr(), self.inner.config.port());
-        full_address.parse::<SocketAddr>().map_err(|e| anyhow!(e.to_string()))
+    pub async fn get_local_node(&self) -> Result<Node> {
+        let local_node = self.inner.members.get_node(self.inner.config.name())?;
+        if let Some(node) = local_node {
+            return Ok(node)
+        }
+
+        Err(anyhow!("local node is not set"))
     }
 
     pub async fn members(&self)-> Result<Vec<Node>>  {
@@ -359,9 +262,9 @@ async fn main() -> Result<()> {
     let mut swim = Swim::new(config).await?;
 
     // Spawn a task to run the Swim instance
-    let swim_clone = swim.clone();
+    let swim_clone1 = swim.clone();
     tokio::spawn(async move {
-        if let Err(e) = swim_clone.start().await {
+        if let Err(e) = swim_clone1.start().await {
             error!("[ERR] Error starting Swim: {:?}", e);
         }
     });
@@ -372,18 +275,32 @@ async fn main() -> Result<()> {
     }
 
     info!("Members: {:?}", swim.members().await?);
-
     info!("[PROCESS] Swim is running");
 
+    // Listen for Ctrl+C or SIGINT
+    let swim_clone2 = swim.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Failed to listen for event");
+        info!("Signal received, stopping Swim...");
+        swim_clone2.stop().await.expect("Failed to stop Swim");
+    });
+
     for _ in 0..10 {
+        if !swim.is_running().await {
+            break;
+        }
         swim.send_message().await?;
         time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Stop Swim
-    swim.stop().await?;
+    // Await until Swim is stopped either by signal or loop completion
+    while swim.is_running().await {
+        time::sleep(Duration::from_millis(100)).await;
+    }
 
     info!("[PROCESS] Swim has been stopped");
+
+   
 
     Ok(())
 }

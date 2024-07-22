@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use crate::node::Node;
@@ -7,7 +6,7 @@ use crate::node::Node;
 
 #[derive(Clone)]
 pub struct Members {
-    nodes: Arc<RwLock<HashMap<IpAddr, Node>>>,
+    nodes: Arc<RwLock<HashMap<String, Node>>>,
 }
 
 impl Members {
@@ -21,22 +20,22 @@ impl Members {
         let mut nodes = self.nodes.write()
             .map_err(|e| anyhow::anyhow!("Failed to acquire write lock: {}", e))?;
         
-        nodes.insert(node.ip_addr, node);
+        nodes.insert(node.name.clone(), node);
         Ok(())
     }
 
-    pub fn remove_node(&self, ip_addr: &IpAddr) -> Result<Option<Node>> {
+    pub fn remove_node(&self, name: String) -> Result<Option<Node>> {
         let mut nodes = self.nodes.write()
             .map_err(|e| anyhow::anyhow!("Failed to acquire write lock: {}", e))?;
         
-        Ok(nodes.remove(ip_addr))
+        Ok(nodes.remove(&name))
     }
 
-    pub fn get_node(&self, ip_addr: &IpAddr) -> Result<Option<Node>> {
+    pub fn get_node(&self, name: String) -> Result<Option<Node>> {
         let nodes = self.nodes.read()
             .map_err(|e| anyhow::anyhow!("Failed to acquire read lock: {}", e))?;
         
-        Ok(nodes.get(ip_addr).cloned())
+        Ok(nodes.get(&name).cloned())
     }
 
     pub fn get_all_nodes(&self) -> Result<Vec<Node>> {

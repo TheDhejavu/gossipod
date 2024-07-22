@@ -18,21 +18,15 @@ type NetworkPacket = (SocketAddr, Vec<u8>);
 #[derive(Clone)]
 pub(crate) struct Transport{
     pub(crate) port: u16,
-
     pub(crate) ip_addr: IpAddr,
-
     // Local TCP listener, the idea is for TCP to handle node-specific messages where reliability and connection
     // are important
     pub(crate) tcp_listener: Arc<RwLock<Option<Arc<TokioTcpListener>>>>,
-
     // Local UDP listener, the idea is for UDP to handle protocol-related messages where connection is 
     // not a must
     pub(crate) udp_socket: Arc<RwLock<Option<Arc<TokioUdpSocket>>>>,
-
     pub(crate) dial_timeout: Duration,
-
     pub(crate) tcp_stream_tx: mpsc::Sender<NetworkPacket>,
-
     pub(crate) udp_packet_tx: mpsc::Sender<NetworkPacket>,
 }
 
