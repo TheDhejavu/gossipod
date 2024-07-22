@@ -59,9 +59,10 @@ impl SwimListener {
         }
     }
     async fn handle_tcp_message(swim: Swim, addr: SocketAddr, data: Vec<u8>) -> Result<()>{
-        // Decoding here, it uses generic MessageCodec, for a more granular approach where we want,
-        // each message to handle it's own decoding / encoding, then this might not work. We might result to
-        // passing the raw byte and leave it the decoding to it's respective message type handler.
+        // This decoding uses a generic MessageCodec. For a more granular approach where each 
+        // message type handles its own decoding/encoding, this method may not be suitable. 
+        // In such cases, we might pass the raw bytes and delegate decoding to the respective 
+        // message type handlers.
 
         let mut codec = MessageCodec::new(); 
         let mut bytes = BytesMut::from(&data[..]);
