@@ -199,8 +199,6 @@ impl Swim {
             }
         };
 
-        // Log the received message and the sender address
-        info!("[RECV] Received message from {}: {}", addr, message);
         match Message::from_json(&message) {
             Ok(parsed_message) => {
 
@@ -258,8 +256,6 @@ impl Swim {
             }
         };
 
-        // Log the received message and the sender address
-        info!("[RECV] Received message from {}: {}", addr, message);
         match Message::from_json(&message) {
             Ok(parsed_message) => {
 

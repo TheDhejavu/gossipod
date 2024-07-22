@@ -108,7 +108,7 @@ impl Transport {
         loop {
             match listener.accept().await {
                 Ok((mut stream, addr)) => {
-                    info!("[RECV] Incoming TCP Message");
+                    info!("[RECV] Incoming TCP Message from: {}", addr);
                     // Spin-up a new background task for every incoming message
                     // NOTE: I have a concern on how feasible this will be in the long run, spinning
                     // up a new background task seems like a bad idea, what happens when we have loads of messages ?
@@ -144,7 +144,7 @@ impl Transport {
         loop {
             match socket.recv_from(&mut buffer).await {
                 Ok((len, addr)) => {
-                    info!("[RECV] Incoming UDP Message");
+                    info!("[RECV] Incoming UDP Message from: {}", addr);
                     let data = buffer[..len].to_vec();
                     if let Err(e) = udp_packet_tx.send((addr, data)).await {
                         error!("Failed to send UDP message to channel: {:?}", e);
