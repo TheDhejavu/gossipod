@@ -2,7 +2,11 @@ use std::net::{IpAddr, SocketAddr};
 use anyhow::{anyhow, Result};
 use crate::state::NodeState;
 
-
+/*
+ *
+ * ===== Node =====
+ *
+ */
 #[derive(Clone, Debug)]
 pub(crate) struct Node {
     // the current node to a port

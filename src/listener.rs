@@ -5,8 +5,13 @@ use log::{error, info};
 use tokio::{select, sync::broadcast};
 use tokio_util::{bytes::BytesMut, codec::Decoder as _};
 
-use crate::{message::{Message, MessageCodec, MessageType}, transport::TransportChannel, Swim};
+use crate::{message::{MessageCodec, MessageType}, transport::TransportChannel, Swim};
 
+/*
+ *
+ * ===== SwimListener =====
+ *
+ */
 pub(crate) struct SwimListener {
     swim: Swim,
     transport_channel: TransportChannel,
@@ -27,6 +32,7 @@ impl SwimListener {
     }
 
     pub(crate) async fn run_listeners(&mut self) {
+
         info!("Starting Listener....");
         let mut shutdown_rx = self.shutdown.subscribe();
 

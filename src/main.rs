@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use config::{SwimConfig, SwimConfigBuilder, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT};
 use ip_addr::IpAddress;
@@ -93,24 +93,27 @@ impl Swim {
 
         Ok(swim)
     }
-    // Swim Communication Flow:
-    // +-------+       +------------+       +---------------------+
-    // | SWIM  +-------> NET_MESSAGE +-------> TRANSPORT LAYER    |
-    // +-------+       +------------+       |      (TCP/UDP)      |
-    //                                       +---------+-----------+
-    //                                                 |
-    //                                                 v
-    //                                       +---------+-----------+
-    //                                       |       LISTENER      |
-    //                                       +---------+-----------+
-    //                                                 |
-    //                         +-----------------------+------------------------+
-    //                         |                                                    |
-    //                         v                                                    v                                
-    //                     +---+---+                                           +---+-----------+                           
-    //                     |  SWIM  |                                           | NET_MESSAGE  |                      
-    //                     +--------+                                           +--------------+                       
-
+    //+=======================+
+    //| SWIM COMMUNICATION LOW:
+    //+=======================+
+    // +-------+       +----------------+       +-------------------+----------------------+
+    // | SWIM  +-------> MESSAGE_BROKER +-------> TRANSPORT LAYER   |                      |
+    // +-------+       +----------------+       |    (TCP/UDP)      |                      |
+    // |                                        +---------+---------+                      |
+    // |                                                  |                                |
+    // |                                                  v                                |
+    // |                                        +---------+---------+                      |
+    // |                                        |     LISTENER      |                      |
+    // |                                        +---------+---------+                      |
+    // |                                                  |                                |
+    // |                                +-----------------+----------------------+         |
+    // |                                |                                        |         |
+    // |                                v                                        v         |                      
+    // |                            +---+----+                           +-------+---------+                           
+    // |                            |  SWIM  |                           | MESSAGE_BROKER  |                      
+    // |                            +--------+                           +-----------------+
+    // |                                                                                   |                       
+    // +-----------------------------------------------------------------------------------+
     pub async fn start(&self) -> Result<()> {
         info!("[SWIM] Server Started with `{}`", self.inner.config.name);
         let mut shutdown_rx = self.inner.shutdown.subscribe();
@@ -299,8 +302,5 @@ async fn main() -> Result<()> {
     }
 
     info!("[PROCESS] Swim has been stopped");
-
-   
-
     Ok(())
 }

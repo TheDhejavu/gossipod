@@ -4,6 +4,11 @@ use anyhow::Result;
 use crate::node::Node;
 
 
+/*
+ *
+ * ===== Members =====
+ *
+ */
 #[derive(Clone)]
 pub struct Members {
     nodes: Arc<RwLock<HashMap<String, Node>>>,

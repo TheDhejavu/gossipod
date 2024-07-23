@@ -135,7 +135,7 @@ impl Encoder<Message> for MessageCodec {
     type Error = anyhow::Error;
 
     /// Encodes a `Message` into a `BytesMut` buffer for transmission.
-    /// encoding format ensures that independent data has it's length set as prefix
+    /// this encoding format ensures that independent data has it's length set as prefix
     /// for accurate decoding and reconstruction of data.
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         // Encode Message Type

@@ -4,15 +4,18 @@ use serde::de::DeserializeOwned;
 use tokio_util::bytes::{Buf as _, BufMut as _, BytesMut};
 
 use crate::message::MessagePayload;
-
+/*
+ *
+ * ===== Codec =====
+ *
+ */
 pub(crate) struct Codec;
-
 
 impl Codec {
     // `read_bytes` read a fixed number of bytes
     pub(crate) fn read_bytes(src: &mut BytesMut, len: usize) -> Result<BytesMut> {
         if src.remaining() < len {
-            return Err(anyhow!("[ERR] Buffer underflow: not enough data"));
+            return Err(anyhow!("Buffer underflow: not enough data"));
         }
         Ok(src.split_to(len))
     }
@@ -55,6 +58,7 @@ impl Codec {
             },
         }
     }
+
     /// `decode_socket_addr` decode a SocketAddr from BytesMut
     pub(crate) fn decode_socket_addr(src: &mut BytesMut) -> Result<SocketAddr, anyhow::Error> {
         let ip_type = src.get_u8();
@@ -72,7 +76,6 @@ impl Codec {
         let port = src.get_u16();
         Ok(SocketAddr::new(ip_addr, port))
     }
-
 }
 
 

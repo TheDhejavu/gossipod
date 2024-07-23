@@ -11,7 +11,6 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::config::{DEFAULT_CHANNEL_BUFFER_SIZE, DEFAULT_MESSAGE_BUFFER_SIZE};
 
-
 type NetworkPacket = (SocketAddr, Vec<u8>);
 
 /// Transport is responsible for sending messages to peers

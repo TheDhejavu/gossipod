@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-
-// Swim Protocol Node
+/*
+ *
+ * ===== NodeState =====
+ *
+ */
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum NodeState {
     Alive,
