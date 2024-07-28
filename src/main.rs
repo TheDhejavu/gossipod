@@ -1,8 +1,8 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use config::{SwimConfig, SwimConfigBuilder, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT};
+use config::{GossipodConfig, GossipodConfigBuilder, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT};
 use ip_addr::IpAddress;
-use listener::SwimListener;
+use listener::EventListener;
 use members::Members;
 use message::MessageBroker;
 use node::Node;
@@ -31,11 +31,11 @@ mod codec;
 /// into several components to foster modularity, shareability, and clarity:
 ///
 
-struct Swim {
+struct Gossipod {
     inner: Arc<SwimInner>,
 }
 
-enum SwimState {
+enum GossipodState {
     Idle,
     Running,
     Stopped,
@@ -43,17 +43,17 @@ enum SwimState {
 
 pub(crate) struct SwimInner  {
     // the node configuration
-    config: SwimConfig,
+    config: GossipodConfig,
     // current members and their current state. every node maintains a map of information
     // about each nodes.
     members: Members,
     transport: Transport,
-    state: RwLock<SwimState>,
+    state: RwLock<GossipodState>,
     shutdown: broadcast::Sender<()>,
     pub(crate) message_broker: MessageBroker,
 }
 
-impl Clone for Swim {
+impl Clone for Gossipod {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -61,8 +61,8 @@ impl Clone for Swim {
     }
 }
 
-impl Swim {
-    pub async fn new(config: SwimConfig) -> Result<Self> {
+impl Gossipod {
+    pub async fn new(config: GossipodConfig) -> Result<Self> {
         env_logger::Builder::new()
             .filter_level(::log::LevelFilter::Info) 
             .init();
@@ -81,14 +81,14 @@ impl Swim {
                 config,
                 message_broker,
                 members: Members::new(),
-                state: RwLock::new(SwimState::Idle),
+                state: RwLock::new(GossipodState::Idle),
                 shutdown: shutdown_tx.clone(),
                 transport,
             })
         };
 
         Self::spawn_listeners(
-            SwimListener::new(swim.clone(), transport_channel, shutdown_tx.clone()),
+            EventListener::new(swim.clone(), transport_channel, shutdown_tx.clone()),
         ).await;
 
         Ok(swim)
@@ -159,7 +159,7 @@ impl Swim {
         }
 
         // set swim state 
-        self.set_state(SwimState::Running).await?;
+        self.set_state(GossipodState::Running).await?;
 
         // join local node to membership list
         self.join_local_node().await?;
@@ -176,14 +176,14 @@ impl Swim {
                 udp_result.map_err(|e| anyhow!("UDP task errored-out: {}", e))??;
             }
             _ = shutdown_rx.recv() => {
-                self.set_state(SwimState::Stopped).await?;
+                self.set_state(GossipodState::Stopped).await?;
                 info!("[SWIM] Gracefully shutting down...");
             }
         }
         Ok(())
     }
 
-    async fn spawn_listeners(mut listener: SwimListener) {
+    async fn spawn_listeners(mut listener: EventListener) {
         tokio::spawn(async move {
             listener.run_listeners().await 
         });
@@ -232,19 +232,19 @@ impl Swim {
     pub async fn stop(&self) -> Result<()> {
         let mut state = self.inner.state.write().await;
         match *state {
-            SwimState::Running => {
+            GossipodState::Running => {
                 self.inner.shutdown.send(()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                *state = SwimState::Stopped;
+                *state = GossipodState::Stopped;
                 Ok(())
             }
-            SwimState::Idle => Err(anyhow::anyhow!("Swim is not running")),
-            SwimState::Stopped => Ok(()),  // Already stopped, no-op
+            GossipodState::Idle => Err(anyhow::anyhow!("Swim is not running")),
+            GossipodState::Stopped => Ok(()),  // Already stopped, no-op
         }
     }
     pub async fn is_running(&self) -> bool {
-        matches!(*self.inner.state.read().await, SwimState::Running)
+        matches!(*self.inner.state.read().await, GossipodState::Running)
     }
-    pub async fn set_state(&self, swim_state: SwimState) -> Result<()> {
+    pub async fn set_state(&self, swim_state: GossipodState) -> Result<()> {
         let mut state = self.inner.state.write().await;
         *state = swim_state;
         Ok(())
@@ -254,7 +254,7 @@ impl Swim {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = SwimConfigBuilder::new()
+    let config = GossipodConfigBuilder::new()
         .name("node_1")
         .port(8080)
         .addr(Ipv4Addr::new(127, 0, 0, 1))
@@ -262,45 +262,45 @@ async fn main() -> Result<()> {
         .build()
         .await?;
     
-    let mut swim = Swim::new(config).await?;
+    let mut gossipod = Gossipod::new(config).await?;
 
     // Spawn a task to run the Swim instance
-    let swim_clone1 = swim.clone();
+    let swim_clone1 = gossipod.clone();
     tokio::spawn(async move {
         if let Err(e) = swim_clone1.start().await {
             error!("[ERR] Error starting Swim: {:?}", e);
         }
     });
 
-    // wait for Swim to start
-    while !swim.is_running().await {
+    // wait for Gossipod to start
+    while !gossipod.is_running().await {
         time::sleep(Duration::from_millis(100)).await;
     }
 
-    info!("Members: {:?}", swim.members().await?);
+    info!("Members: {:?}", gossipod.members().await?);
     info!("[PROCESS] Swim is running");
 
     // Listen for Ctrl+C or SIGINT
-    let swim_clone2 = swim.clone();
+    let gossipod_clone2 = gossipod.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.expect("Failed to listen for event");
         info!("Signal received, stopping Swim...");
-        swim_clone2.stop().await.expect("Failed to stop Swim");
+        gossipod_clone2.stop().await.expect("Failed to stop Swim");
     });
 
     for _ in 0..10 {
-        if !swim.is_running().await {
+        if !gossipod.is_running().await {
             break;
         }
-        swim.send_message().await?;
+        gossipod.send_message().await?;
         time::sleep(Duration::from_secs(1)).await;
     }
 
     // Await until Swim is stopped either by signal or loop completion
-    while swim.is_running().await {
+    while gossipod.is_running().await {
         time::sleep(Duration::from_millis(100)).await;
     }
 
-    info!("[PROCESS] Swim has been stopped");
+    info!("[PROCESS] Gossipod has been stopped");
     Ok(())
 }

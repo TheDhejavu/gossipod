@@ -18,7 +18,7 @@ pub(crate) const DEFAULT_TRANSPORT_TIMEOUT: u64 = 5_000;
 pub(crate) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 100;
 
 #[derive(Debug, Clone)]
-pub(crate) struct SwimConfig {
+pub(crate) struct GossipodConfig {
     pub(crate) name: String,
     pub(crate) port: u16,
     pub(crate) ip_addrs: Vec<IpAddr>,
@@ -29,7 +29,7 @@ pub(crate) struct SwimConfig {
     pub(crate) suspect_timeout: Duration,
 }
 
-impl SwimConfig {
+impl GossipodConfig {
     /// Get the IP addresses.
     pub fn ip_addrs(&self) -> &[IpAddr] {
         &self.ip_addrs
@@ -51,7 +51,7 @@ impl SwimConfig {
 
 // Configuration for SWIM protocol.
 #[derive(Debug, Clone)]
-pub(crate) struct SwimConfigBuilder {
+pub(crate) struct GossipodConfigBuilder {
     /// Optional name for the node.
     pub(crate) name: Option<String>,
     
@@ -78,8 +78,8 @@ pub(crate) struct SwimConfigBuilder {
 }
 
 
-impl Default for SwimConfigBuilder {
-    fn default() -> SwimConfigBuilder {
+impl Default for GossipodConfigBuilder {
+    fn default() -> GossipodConfigBuilder {
         let ip_addr = IpAddr::V4(Ipv4Addr::from_str(DEFAULT_IP_ADDR)
             .expect(&format!("unable to parse default ip addr: {}", DEFAULT_IP_ADDR)));
 
@@ -96,7 +96,7 @@ impl Default for SwimConfigBuilder {
     }
 }
 
-impl SwimConfigBuilder {
+impl GossipodConfigBuilder {
     pub fn new() -> Self {
         Self::default()
     }
@@ -170,11 +170,11 @@ impl SwimConfigBuilder {
         Ok(())
     }
 
-    pub async fn build(mut self) -> Result<SwimConfig> {
+    pub async fn build(mut self) -> Result<GossipodConfig> {
         self.fill();
         self.validate()?;
 
-        Ok(SwimConfig {
+        Ok(GossipodConfig {
             name: self.name.unwrap(),
             port: self.port,
             ip_addrs: self.ip_addrs,

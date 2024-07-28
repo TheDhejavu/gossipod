@@ -5,27 +5,27 @@ use log::{error, info};
 use tokio::{select, sync::broadcast};
 use tokio_util::{bytes::BytesMut, codec::Decoder as _};
 
-use crate::{message::{MessageCodec, MessageType}, transport::TransportChannel, Swim};
+use crate::{message::{MessageCodec, MessageType}, transport::TransportChannel, Gossipod};
 
 /*
  *
  * ===== SwimListener =====
  *
  */
-pub(crate) struct SwimListener {
-    swim: Swim,
+pub(crate) struct EventListener {
+    gossipod: Gossipod,
     transport_channel: TransportChannel,
     shutdown: broadcast::Sender<()>,
 }
 
-impl SwimListener {
+impl EventListener {
     pub(crate) fn new(
-        swim: Swim, 
+        gossipod: Gossipod, 
         transport_channel: TransportChannel,
         shutdown: broadcast::Sender<()>,
-    ) -> SwimListener {
+    ) -> EventListener {
         Self { 
-            swim, 
+            gossipod, 
             transport_channel,
             shutdown,
         }
@@ -40,9 +40,9 @@ impl SwimListener {
             select! {
                 tcp_result = self.transport_channel.tcp_stream_rx.recv() => {
                     if let Some((addr, data)) = tcp_result {
-                        let swim_clone = self.swim.clone();
+                        let gossipod_clone = self.gossipod.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = Self::handle_tcp_message(swim_clone, addr, data).await {
+                            if let Err(e) = Self::handle_tcp_message(gossipod_clone, addr, data).await {
                                 error!("Error handling TCP stream: {:?}", e);
                             }
                         });
@@ -50,9 +50,9 @@ impl SwimListener {
                 },
                 udp_result = self.transport_channel.udp_packet_rx.recv() => {
                     if let Some((addr, data)) = udp_result {
-                        let swim_clone = self.swim.clone();
+                        let gossipod_clone = self.gossipod.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = Self::handle_udp_message(swim_clone, addr, data).await {
+                            if let Err(e) = Self::handle_udp_message(gossipod_clone, addr, data).await {
                                 error!("Error handling UDP packet: {:?}", e);
                             }
                         });
@@ -64,7 +64,7 @@ impl SwimListener {
             }
         }
     }
-    async fn handle_tcp_message(swim: Swim, addr: SocketAddr, data: Vec<u8>) -> Result<()>{
+    async fn handle_tcp_message(gossipod: Gossipod, addr: SocketAddr, data: Vec<u8>) -> Result<()>{
         // This decoding uses a generic MessageCodec. For a more granular approach where each 
         // message type handles its own decoding/encoding, this method may not be suitable. 
         // In such cases, we might pass the raw bytes and delegate decoding to the respective 
@@ -110,7 +110,7 @@ impl SwimListener {
         }
         Ok(())
     }
-    async fn handle_udp_message(swim: Swim,addr: SocketAddr, data: Vec<u8>) -> Result<()>{
+    async fn handle_udp_message(gossipod: Gossipod,addr: SocketAddr, data: Vec<u8>) -> Result<()>{
         let mut codec = MessageCodec::new(); 
         let mut bytes = BytesMut::from(&data[..]);
         let message  = match codec.decode(&mut bytes) {

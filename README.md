@@ -1,4 +1,4 @@
-# swim-rs
+# Gossipod
 A Simple Asynchronous Swim Protocol written in Rust: [SWIM Protocol Paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
 
 ### TODO List
@@ -34,7 +34,7 @@ A Simple Asynchronous Swim Protocol written in Rust: [SWIM Protocol Paper](https
 ```rust
 #[tokio::main]
 async fn main() -> Result<()> {
-   let config = SwimConfigBuilder::new()
+    let config = GossipodConfigBuilder::new()
         .name("node_1")
         .port(8080)
         .addr(Ipv4Addr::new(127, 0, 0, 1))
@@ -42,34 +42,46 @@ async fn main() -> Result<()> {
         .build()
         .await?;
     
-   let mut swim = Swim::new(config).await?;
+    let mut gossipod = Gossipod::new(config).await?;
 
-   // Spawn a task to run the Swim instance
-   let swim_clone = swim.clone();
-   tokio::spawn(async move {
-      if let Err(e) = swim_clone.start().await {
-         error!("[ERR] Error starting Swim: {:?}", e);
-      }
-   });
+    // Spawn a task to run the Swim instance
+    let swim_clone1 = gossipod.clone();
+    tokio::spawn(async move {
+        if let Err(e) = swim_clone1.start().await {
+            error!("[ERR] Error starting Swim: {:?}", e);
+        }
+    });
 
-   // wait for Swim to start
-   while !swim.is_running().await {
-      time::sleep(Duration::from_millis(100)).await;
-   }
+    // wait for Gossipod to start
+    while !gossipod.is_running().await {
+        time::sleep(Duration::from_millis(100)).await;
+    }
 
-   info!("Members: {:?}", swim.members().await?);
+    info!("Members: {:?}", gossipod.members().await?);
+    info!("[PROCESS] Swim is running");
 
-   info!("[PROCESS] Swim is running");
+    // Listen for Ctrl+C or SIGINT
+    let gossipod_clone2 = gossipod.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Failed to listen for event");
+        info!("Signal received, stopping Swim...");
+        gossipod_clone2.stop().await.expect("Failed to stop Swim");
+    });
 
-   for _ in 0..10 {
-      swim.send_message().await?;
-      time::sleep(Duration::from_secs(1)).await;
-   }
+    for _ in 0..10 {
+        if !gossipod.is_running().await {
+            break;
+        }
+        gossipod.send_message().await?;
+        time::sleep(Duration::from_secs(1)).await;
+    }
 
-   // Stop Swim
-   swim.stop().await?;
+    // Await until Swim is stopped either by signal or loop completion
+    while gossipod.is_running().await {
+        time::sleep(Duration::from_millis(100)).await;
+    }
 
-   info!("[PROCESS] Swim has been stopped");
-   Ok(())
+    info!("[PROCESS] Gossipod has been stopped");
+    Ok(())
 }
 ```
