@@ -2,6 +2,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use config::{GossipodConfig, GossipodConfigBuilder, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT, MAX_CONSECUTIVE_FAILURES};
+use event::EventManager;
 use ip_addr::IpAddress;
 use listener::EventListener;
 use members::MembershipList;
@@ -26,7 +27,7 @@ mod members;
 mod listener;
 mod codec;
 mod retry_state;
-
+mod event;
 /// # SWIM Protocol Implementation
 ///
 /// This module implements a simple asynchronous SWIM (Scalable Weakly-consistent
@@ -52,7 +53,6 @@ enum ShutdownReason {
     SchedulerFailure,
 }
 
-
 pub(crate) struct InnerGossipod  {
     // the node configuration
     config: GossipodConfig,
@@ -64,6 +64,7 @@ pub(crate) struct InnerGossipod  {
     shutdown: broadcast::Sender<()>,
     sequence_number: AtomicU64,
     incarnation: AtomicU64,
+    event_manager: EventManager,
     pub(crate) message_broker: MessageBroker,
 }
 
@@ -100,6 +101,7 @@ impl Gossipod {
                 transport,
                 sequence_number: AtomicU64::new(0),
                 incarnation: AtomicU64::new(0),
+                event_manager: EventManager::new(),
             })
         };
 

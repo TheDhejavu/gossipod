@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     // Await until Gossipod is stopped either by signal or loop completion
     while gossipod.is_running().await {
         time::sleep(Duration::from_millis(100)).await;
-    }
+    }o
 
     info!("[PROCESS] Gossipod has been stopped");
     Ok(())
