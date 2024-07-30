@@ -1,3 +1,4 @@
+use core::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use log::{error, info, warn};
@@ -11,7 +12,23 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::config::{DEFAULT_CHANNEL_BUFFER_SIZE, DEFAULT_MESSAGE_BUFFER_SIZE};
 
+
 type NetworkPacket = (SocketAddr, Vec<u8>);
+
+#[derive(Clone)]
+pub(crate) enum Protocol {
+    TCP,
+    UDP
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Protocol::TCP => write!(f, "TCP"),
+            Protocol::UDP => write!(f, "UDP"),
+        }
+    }
+}
 
 /// Transport is responsible for sending messages to peers
 #[derive(Clone)]
@@ -36,6 +53,9 @@ pub(crate) struct TransportChannel {
 
 #[async_trait::async_trait]
 pub(crate) trait NodeTransport: Send + Sync  {
+    async fn recv_stream(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)>;
+    async fn recv_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> ;
+    
     async fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpStream>;
     async fn write_to_tcp(&self, stream: &mut TcpStream, message: &[u8]) -> Result<()>;
     async fn write_to_udp(&self, addr: SocketAddr, message: &[u8]) -> Result<()>;
@@ -69,6 +89,24 @@ impl NodeTransport for Transport {
             .context("UDP send timed out")?
             .map(|_| ())
             .context("Failed to send UDP message")
+    }
+
+    // listen and receive udp packet
+    async fn recv_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let udp_socket = self.udp_socket.read().await;
+        let socket = udp_socket.as_ref().ok_or_else(|| anyhow!("UDP socket not initialized"))?;
+        socket.recv_from(buf).await.context("Failed to receive UDP message")
+    }
+
+    // listen and receive tcp stream
+    async fn recv_stream(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let tcp_listener = self.tcp_listener.read().await;
+        let listener = tcp_listener.as_ref()
+            .ok_or_else(|| anyhow!("TCP listener not initialized"))?;
+        
+        let  (mut stream, addr) = listener.accept().await.context("Failed to accept TCP connection")?;
+        let size =stream.read(buf).await.context("Failed to receive TCP stream data")?;
+        Ok((size, addr))
     }
 }
 
@@ -147,6 +185,7 @@ impl Transport {
             }
         }
     }
+
     /// Binds the TCP listener to the configured address and port
     pub(crate) async fn bind_tcp_listener(&self) -> Result<()> {
         let bind_addr = SocketAddr::new(self.ip_addr, self.port);

@@ -1,11 +1,13 @@
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use config::{GossipodConfig, GossipodConfigBuilder, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT};
+use config::{GossipodConfig, GossipodConfigBuilder, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT, MAX_CONSECUTIVE_FAILURES};
 use ip_addr::IpAddress;
 use listener::EventListener;
-use members::Members;
+use members::MembershipList;
 use message::MessageBroker;
 use node::Node;
+use retry_state::RetryState;
 use state::NodeState;
 use log::*;
 use tokio::sync::{broadcast, RwLock};
@@ -13,7 +15,7 @@ use tokio::time;
 use transport::Transport;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow,  Result};
 mod transport;
 mod message;
 mod ip_addr;
@@ -23,6 +25,7 @@ mod node;
 mod members;
 mod listener;
 mod codec;
+mod retry_state;
 
 /// # SWIM Protocol Implementation
 ///
@@ -32,7 +35,7 @@ mod codec;
 ///
 
 struct Gossipod {
-    inner: Arc<SwimInner>,
+    inner: Arc<InnerGossipod>,
 }
 
 enum GossipodState {
@@ -41,15 +44,26 @@ enum GossipodState {
     Stopped,
 }
 
-pub(crate) struct SwimInner  {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShutdownReason {
+    Termination,
+    TcpFailure,
+    UdpFailure,
+    SchedulerFailure,
+}
+
+
+pub(crate) struct InnerGossipod  {
     // the node configuration
     config: GossipodConfig,
     // current members and their current state. every node maintains a map of information
     // about each nodes.
-    members: Members,
+    members: MembershipList,
     transport: Transport,
     state: RwLock<GossipodState>,
     shutdown: broadcast::Sender<()>,
+    sequence_number: AtomicU64,
+    incarnation: AtomicU64,
     pub(crate) message_broker: MessageBroker,
 }
 
@@ -77,13 +91,15 @@ impl Gossipod {
         let message_broker = MessageBroker::new(Box::new(transport.clone()));
 
         let swim = Self {
-            inner: Arc::new(SwimInner {
+            inner: Arc::new(InnerGossipod {
                 config,
                 message_broker,
-                members: Members::new(),
+                members: MembershipList::new(),
                 state: RwLock::new(GossipodState::Idle),
                 shutdown: shutdown_tx.clone(),
                 transport,
+                sequence_number: AtomicU64::new(0),
+                incarnation: AtomicU64::new(0),
             })
         };
 
@@ -93,57 +109,95 @@ impl Gossipod {
 
         Ok(swim)
     }
-    //+=======================+
-    //| SWIM COMMUNICATION LOW:
-    //+=======================+
-    // +-------+       +----------------+       +-------------------+----------------------+
-    // | SWIM  +-------> MESSAGE_BROKER +-------> TRANSPORT LAYER   |                      |
-    // +-------+       +----------------+       |    (TCP/UDP)      |                      |
-    // |                                        +---------+---------+                      |
-    // |                                                  |                                |
-    // |                                                  v                                |
-    // |                                        +---------+---------+                      |
-    // |                                        |     LISTENER      |                      |
-    // |                                        +---------+---------+                      |
-    // |                                                  |                                |
-    // |                                +-----------------+----------------------+         |
-    // |                                |                                        |         |
-    // |                                v                                        v         |                      
-    // |                            +---+----+                           +-------+---------+                           
-    // |                            |  SWIM  |                           | MESSAGE_BROKER  |                      
-    // |                            +--------+                           +-----------------+
-    // |                                                                                   |                       
-    // +-----------------------------------------------------------------------------------+
+    //+=========================+
+    //| GOSSIPOD COMMUNICATION LOW:
+    //+=========================+
+    // +-----------+       +----------------+       +-------------------+----------------------+
+    // | gossipod  +-------> message_broker +-------> transport layer   |                      |
+    // +-----------+       +----------------+       |    (TCP/UDP)      |                      |
+    // |                                            +---------+---------+                      |
+    // |                                                      |                                |
+    // |                                                      v                                |
+    // |                                            +---------+---------+                      |
+    // |                                            |     listener      |                      |
+    // |                                            +---------+---------+                      |
+    // |                                                      |                                |
+    // |                                    +-----------------+------------------------+       |
+    // |                                    |                                          |       |
+    // |                                    v                                          v       |                      
+    // |                              +-----+------+                           +-------+-------+                           
+    // |                              |  gossipod  |                           | message_broker|                      
+    // |                              +------------+                           +---------------+
+    // |                                                                                |                       
+    // +--------------------------------------------------------------------------------+
     pub async fn start(&self) -> Result<()> {
-        info!("[SWIM] Server Started with `{}`", self.inner.config.name);
-        let mut shutdown_rx = self.inner.shutdown.subscribe();
+        info!("[GOSSIPOD] Server Started with `{}`", self.inner.config.name);
+        let shutdown_rx = self.inner.shutdown.subscribe();
 
-        // Bind TCP & UDP to IP and Port configuration
         self.inner.transport.bind_tcp_listener().await?;
         self.inner.transport.bind_udp_socket().await?;
 
-        // Start TCP & UDP listeners
-        let tcp_handler = {
-            let this = self.clone();
-            tokio::spawn(async move { 
-                this.inner.transport.tcp_stream_listener().await 
-            })
-        };
-        
-        let udp_handler = {
-            let this = self.clone();
-            tokio::spawn(async move { 
-                this.inner.transport.udp_packet_listener().await 
-            })
-        };
+        self.log_ip_binding_info().await?;
 
+        self.set_state(GossipodState::Running).await?;
+
+        self.join_local_node().await?;
+
+        let tcp_handle = Self::spawn_tcp_listener_with_retry(
+            self.inner.transport.clone(),
+            RetryState::new(),
+            self.inner.shutdown.subscribe(),
+        );
+        let udp_handle = Self::spawn_udp_listener_with_retry(
+            self.inner.transport.clone(),
+            RetryState::new(),
+            self.inner.shutdown.subscribe(),
+        );
+        let scheduler_handle = self.spawn_scheduler(self.inner.shutdown.subscribe());
+
+        let shutdown_reason = self.handle_shutdown_signal(
+            tcp_handle, 
+            udp_handle, 
+            scheduler_handle, 
+            shutdown_rx,
+        ).await?;
+
+        if shutdown_reason != ShutdownReason::Termination {
+            self.inner.shutdown.send(()).
+                map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
+    
+        self.set_state(GossipodState::Stopped).await?;
+        info!("[GOSSIPOD] Gracefully shut down due to {:?}", shutdown_reason);
+    
+        Ok(())
+    }
+
+    async fn handle_shutdown_signal(
+        &self,
+        tcp_handle: tokio::task::JoinHandle<Result<()>>,
+        udp_handle: tokio::task::JoinHandle<Result<()>>,
+        scheduler_handle: tokio::task::JoinHandle<Result<()>>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> Result<ShutdownReason> {
+        tokio::select! {
+            _ = tcp_handle => Ok(ShutdownReason::TcpFailure),
+            _ = udp_handle => Ok(ShutdownReason::UdpFailure),
+            _ = scheduler_handle => Ok(ShutdownReason::SchedulerFailure),
+            _ = shutdown_rx.recv() => {
+                info!("[GOSSIPOD] Initiating graceful shutdown..");
+                Ok(ShutdownReason::Termination)
+            }
+        }
+    }
+    async fn log_ip_binding_info(&self)-> Result<()>{
         // Note: When the Local Host (127.0.0.1 or 0.0.0.0) is provisioned, it is automatically bound to the system's private IP.
         // If a Private IP address is bound, the local host (127.0.0.1) becomes irrelevant.
         let private_ip_addr = IpAddress::find_system_ip()?;
         for ip_addr in &self.inner.config.ip_addrs {
             if ip_addr.to_string() == DEFAULT_IP_ADDR || ip_addr.to_string() == "0.0.0.0" {
                 info!(
-                    " [SWIM] Binding to all network interfaces: {}:{} (Private IP: {}:{})",
+                    " [GOSSIPOD] Binding to all network interfaces: {}:{} (Private IP: {}:{})",
                     ip_addr.to_string(),
                     self.inner.config.port,
                     private_ip_addr.to_string(),
@@ -151,33 +205,10 @@ impl Gossipod {
                 );
             } else {
                 info!(
-                    "[SWIM] Binding to specific IP: {}:{}",
+                    "[GOSSIPOD] Binding to specific IP: {}:{}",
                     ip_addr.to_string(),
                     self.inner.config.port
                 );
-            }
-        }
-
-        // set swim state 
-        self.set_state(GossipodState::Running).await?;
-
-        // join local node to membership list
-        self.join_local_node().await?;
-       
-        // Here, Both the TCP and UDP listener tasks are spawned and run concurrently in the background.
-        // The downside of this is that, the process is spawned and if an error occurs in one of the task, 
-        // it shutdowns the whole protocol. 
-        // TODO? add a retry strategy to re-initialize the TCP/UDP background listeners
-        tokio::select! {
-            tcp_result = tcp_handler => {
-                tcp_result.map_err(|e| anyhow!("TCP task errored-out: {}", e))??;
-            }
-            udp_result = udp_handler => {
-                udp_result.map_err(|e| anyhow!("UDP task errored-out: {}", e))??;
-            }
-            _ = shutdown_rx.recv() => {
-                self.set_state(GossipodState::Stopped).await?;
-                info!("[SWIM] Gracefully shutting down...");
             }
         }
         Ok(())
@@ -188,19 +219,189 @@ impl Gossipod {
             listener.run_listeners().await 
         });
     }
+
+    fn spawn_tcp_listener_with_retry(
+        transport: Transport,
+        mut retry_state: RetryState,
+        mut shutdown_rx: broadcast::Receiver<()>
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    listener_result = transport.tcp_stream_listener() => {
+                        match listener_result {
+                            Ok(_) => {
+                                retry_state.record_success();
+                            }
+                            Err(e) => {
+                                let failures = retry_state.record_failure();
+                                error!("TCP listener error: {}. Consecutive failures: {}", e, failures);
+                                
+                                if failures >= MAX_CONSECUTIVE_FAILURES {
+                                    return Err(anyhow!("TCP listener failed {} times consecutively", failures));
+                                }
+            
+                                let delay = retry_state.calculate_delay();
+                                warn!("TCP listener restarting in {:?}", delay);
+                                
+                                tokio::select! {
+                                    _ = time::sleep(delay) => {}
+                                    _ = shutdown_rx.recv() => {
+                                        warn!("Shutdown signal received during TCP listener restart delay");
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        warn!("Shutdown signal received, stopping TCP listener");
+                        return Ok(());
+                    }
+                }
+            }
+        })
+    }
     
-    pub async fn send_message(&mut self) -> Result<()> {
-        let members = self.members().await?;
-        for node in &members {
-            let sender = self.get_local_node().await?.socket_addr()?;
-            let target = node.socket_addr()?;
-            self.inner.message_broker.send_ping(sender, target).await?;
-        }
-        Ok(())
+    fn spawn_udp_listener_with_retry(
+        transport: Transport,
+        mut retry_state: RetryState,
+        mut shutdown_rx: broadcast::Receiver<()>
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    listener_result = transport.udp_packet_listener() => {
+                        match listener_result {
+                            Ok(_) => {
+                                retry_state.record_success();
+                            }
+                            Err(e) => {
+                                let failures = retry_state.record_failure();
+                                error!("UDP listener error: {}. Consecutive failures: {}", e, failures);
+                                
+                                if failures >= MAX_CONSECUTIVE_FAILURES {
+                                    return Err(anyhow!("TCP listener failed {} times consecutively", failures));
+                                }
+            
+                                let delay = retry_state.calculate_delay();
+                                warn!("UDP listener restarting in {:?}", delay);
+                                
+                                tokio::select! {
+                                    _ = time::sleep(delay) => {}
+                                    _ = shutdown_rx.recv() => {
+                                        warn!("Shutdown signal received during TCP listener restart delay");
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        warn!("Shutdown signal received, stopping UDP listener");
+                        return Ok(());
+                    }
+                }
+            }
+        })
+    }
+
+    fn spawn_scheduler(&self, mut shutdown_rx: broadcast::Receiver<()>) -> tokio::task::JoinHandle<Result<()>> {
+        let gossipod = self.clone();
+        
+        // Probing is how we detect failure and Dissemination is how 
+        // we randomly broadcast message in an infectious-style
+        // E.G: When we discover a DEAD, ALIVE, SUSPECT Node, we can disseminate 
+        // the state change by broadcasting it
+
+        // 1. FAILURE DETECTION USING PROBING
+        // 1. Pick a node at random using round-robin 
+        // 2. Send a PING message to the node
+        // 3. If Received, Node send back an ACK message
+        // 4. If Failed, Pick random nodes and send an INDIRECT PING-REQ for INDIRECT ACK to it specifying the target node for the request
+        // 5. If Success, Do Nothing
+        // 6. If Failed, Mark The node as suspicious, When a state change , disseminate message to a random node, till its propagated
+        // 7. If suspicious is indeed dead, it is kicked out of the membership list
+        // 8. If Not, the node will have to refute it and is alive state will be re-instated
+        // 9. End
+        // Perform probing action
+
+        // 1.INFORMATION DISSEMINATION THROUGH PUSH PULL (SYNC) & GOSSIPING
+        // 1. Pick x nodes at random using round-robin 
+        // 2. Send a PUSH PULL message to the nodes which includes the membership information of the source node
+        // 3. If Received, Node send back an PUSH PULL response containing full state sync of the target node
+        // 9. End
+        // Perform dissemination action
+
+        // Basically we have:
+        // PROBING: For detecting failure
+        // GOSSIPING: For disseminating node state change in one node targeting x randomly selected nodes
+        // PUSH PULL (refer to hashicorp): For performing full state sync between one node and x randomly selected nodes
+        tokio::spawn(async move {
+            // Create a ticker for the probing interval
+            let mut probe_interval = time::interval(gossipod.inner.config.probing_interval);
+
+            // Create a ticker for the gossip interval
+            let mut gossip_interval = time::interval(gossipod.inner.config.gossip_interval);
+
+            loop {
+                tokio::select! {
+                    _ = probe_interval.tick() => {
+                        if let Err(e) = gossipod.probe().await {
+                            error!("Error during probing: {}", e);
+                        }
+                    }
+                    _ = gossip_interval.tick() => {
+                        if let Err(e) = gossipod.gossip().await {
+                            error!("Error during gossiping: {}", e);
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        info!("Scheduler shutting down");
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })
     }
    
+    /// Generate the next sequence number for message ordering.
+    /// This method allows wrapping around to 0 when the maximum is reached.
+    fn next_sequence_number(&self) -> u64 {
+        self.inner.sequence_number.fetch_add(1, Ordering::SeqCst)
+    }
+
+   /// Generate the next incarnation number for conflict resolution.
+    fn next_incarnation(&self) -> u64 {
+        self.inner.incarnation.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Gossipod PROBE - Probes randomly selected nodes
+    pub(crate) async fn probe(&self) -> Result<()> {
+        debug!("PROBING");
+        // unimplemented!()
+        Ok(())
+    }
+
+    /// Gossipod GOSSIP - Gossip with randomly selected nodes for state changes
+    pub(crate) async fn gossip(&self) -> Result<()> {
+        debug!("GOSSIP");
+        Ok(())
+    }
+
+    /// Gossipod JOIN - Notifies nodes of a peer joining 
     pub async fn join(&self) -> Result<()> {
-        panic!("unimplement join")
+        debug!("JOINING");
+        // unimplemented!()
+        println!("{:?}", self.inner.members.next_node(Some(|n: &Node| n.name == self.inner.config.name)));
+        Ok(())
+    }
+
+    /// Gossipod LEAVE - Notifies nodes of a peer leaving 
+    pub async fn leave(&mut self) {
+        debug!("LEAVING");
+        unimplemented!()
     }
 
     async fn join_local_node(&self)-> Result<()>  {
@@ -212,6 +413,15 @@ impl Gossipod {
             .with_state(NodeState::Alive);
 
         self.inner.members.add_node(node)?;
+
+        let node2 = Node::new(ip_addr, port, "node_2".to_string()).with_state(NodeState::Alive);;
+        let node3 = Node::new(ip_addr, port, "node_3".to_string()).with_state(NodeState::Alive);;
+        let node4 = Node::new(ip_addr, port, "node_4".to_string()).with_state(NodeState::Dead);;
+        let node5 = Node::new(ip_addr, port, "node_5".to_string()).with_state(NodeState::Alive);;
+        self.inner.members.add_node(node2)?;
+        self.inner.members.add_node(node3)?;
+        self.inner.members.add_node(node4)?;
+        self.inner.members.add_node(node5)?;
 
         Ok(())
     }
@@ -261,42 +471,38 @@ async fn main() -> Result<()> {
         .ping_timeout(Duration::from_millis(2000))
         .build()
         .await?;
-    
-    let mut gossipod = Gossipod::new(config).await?;
 
-    // Spawn a task to run the Swim instance
-    let swim_clone1 = gossipod.clone();
+    let gossipod = Gossipod::new(config).await?;
+
+    let gossipod_clone1 = gossipod.clone();
     tokio::spawn(async move {
-        if let Err(e) = swim_clone1.start().await {
-            error!("[ERR] Error starting Swim: {:?}", e);
+        if let Err(e) = gossipod_clone1.start().await {
+            error!("[ERR] Error starting Gossipod: {:?}", e);
         }
     });
 
-    // wait for Gossipod to start
     while !gossipod.is_running().await {
         time::sleep(Duration::from_millis(100)).await;
     }
 
     info!("Members: {:?}", gossipod.members().await?);
-    info!("[PROCESS] Swim is running");
+    info!("[PROCESS] Gossipod is running");
 
-    // Listen for Ctrl+C or SIGINT
     let gossipod_clone2 = gossipod.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.expect("Failed to listen for event");
-        info!("Signal received, stopping Swim...");
-        gossipod_clone2.stop().await.expect("Failed to stop Swim");
+        info!("Signal received, stopping Gossipod...");
+        gossipod_clone2.stop().await.expect("Failed to stop Gossipod");
     });
 
-    for _ in 0..10 {
+    for _ in 0..1000 {
         if !gossipod.is_running().await {
             break;
         }
-        gossipod.send_message().await?;
+        gossipod.join().await?;
         time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Await until Swim is stopped either by signal or loop completion
     while gossipod.is_running().await {
         time::sleep(Duration::from_millis(100)).await;
     }

@@ -1,11 +1,13 @@
-// Swim Protocol Message and Message Type.
-use anyhow::{anyhow, Result};
+// SWIM Protocol Message and Message Type.
+use anyhow::{anyhow, Context as _, Result};
 use serde::{Deserialize, Serialize};
-use tokio_util::{bytes::{Buf as _, BufMut, BytesMut}, codec::{Decoder, Encoder}};
+use tokio::time::timeout;
+use tokio_util::{bytes::BytesMut, codec::{Decoder as _, Encoder}};
 use uuid::Uuid;
-use std::net::SocketAddr;
+use core::fmt;
+use std::{net::SocketAddr, time::Duration};
 
-use crate::{codec::Codec, transport::NodeTransport, NodeState};
+use crate::{codec::MessageCodec, config::DEFAULT_MESSAGE_BUFFER_SIZE, transport::NodeTransport, NodeState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PingPayload {
@@ -14,10 +16,7 @@ pub(crate) struct PingPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PingReqPayload {
-    // target node socket address for PING_REQ
     pub target: SocketAddr,
-
-    // sequence number
     pub sequence_number: u64,
 }
 
@@ -28,43 +27,41 @@ pub(crate) struct AckPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JoinPayload {
-    // name of the node that's joining
     pub node: String,
-
-    // socket address of the node
     pub address: SocketAddr,
-
-    // metadata of the node
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LeavePayload {
-    // name of the node
     pub node: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FailPayload {
-    // name of the node that failed
-    pub failed_node: String,
-
-    // name of the node that detected the failure
+pub(crate) struct DeadPayload {
+    pub node: String,
     pub detected_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct UpdatePayload {
-    pub updates: Vec<MembershipUpdate>,
+pub(crate) struct SyncReqPayload {
+    pub node: String,
+    pub members: Vec<NodeEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct MembershipUpdate {
-    // name of the node that require update
-    pub node: String,
-
-    // state of the node
+pub(crate) struct NodeEntry {
+    pub name: String,
+    pub address: SocketAddr,
+    pub region: Option<String>,
     pub state: NodeState,
+    pub incarnation: u64,
+}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AnnouncePayload {
+    pub node: String,
+    pub address: SocketAddr,
+    pub state: NodeState,
     pub incarnation: u64,
 }
 
@@ -80,18 +77,40 @@ pub(crate) enum MessagePayload {
     Ack(AckPayload),
     Join(JoinPayload),
     Leave(LeavePayload),
-    Fail(FailPayload),
-    Update(UpdatePayload),
+    Dead(DeadPayload),
+    SyncReq(SyncReqPayload),
     AppMsg(AppMsgPayload),
 }
 
+// NOTES:
+// PING and PING-REQ wil be used for failure detections and information
+// dissemination , which means messages have to be piggybacked while we wait or we can 
+// create a future event that will wait for ack message based on sequence number within a time
+// frame. PIN or PING-REQ will happen via constant probing
+
+// JOIN, when a node joins, it must specify a node, we will send a SYNC-REQ message to the target node
+// hoping to get a response via SYNC-RESP containing the memebership entry of the target node, thereby'
+// allowing us to perform a full-sync between the new node and the target node
+// if successful , the target node can create a broadcast notifying the nodes of a JOIN that cab 
+// be queued and bradcasted later to randomly selected nodes.
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Message {
-    pub(crate) id: String,
+    pub(crate) id: Uuid,
     pub(crate) msg_type: MessageType,
     pub(crate) payload: MessagePayload,
     pub(crate) sender: SocketAddr,
     pub(crate) timestamp: u64,
+}
+
+impl Message {
+    pub(crate) fn from_vec(data: &[u8]) -> Result<Self> {
+        let mut codec = MessageCodec::new();
+        let mut bytes = BytesMut::from(data);
+        codec.decode(&mut bytes)?
+            .ok_or_else(|| anyhow!("Unable to decode message"))
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,119 +121,61 @@ pub enum MessageType {
     Ack = 2,
     Join = 3,
     Leave = 4,
-    Fail = 5,
-    Update = 6,
+    Dead = 5,
+    SyncReq = 6,
     AppMsg = 7,
 }
 
 impl MessageType {
-    pub(crate)  fn from_u8(value: u8) -> Result<Self> {
+    pub(crate) fn from_u8(value: u8) -> Result<Self> {
         match value {
             0 => Ok(MessageType::Ping),
             1 => Ok(MessageType::PingReq),
             2 => Ok(MessageType::Ack),
             3 => Ok(MessageType::Join),
             4 => Ok(MessageType::Leave),
-            5 => Ok(MessageType::Fail),
-            6 => Ok(MessageType::Update),
+            5 => Ok(MessageType::Dead),
+            6 => Ok(MessageType::SyncReq),
             7 => Ok(MessageType::AppMsg),
             _ => Err(anyhow!("Invalid MessageType value: {}", value)),
         }
     }
 }
 
-pub(crate) struct MessageCodec;
-
-impl MessageCodec {
-    pub(crate) fn new() -> Self {
-        MessageCodec
-    }
-}
-
-impl Encoder<Message> for MessageCodec {
-    type Error = anyhow::Error;
-
-    /// Encodes a `Message` into a `BytesMut` buffer for transmission.
-    /// this encoding format ensures that independent data has it's length set as prefix
-    /// for accurate decoding and reconstruction of data.
-    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        // Encode Message Type
-        dst.put_u8(item.msg_type as u8);
-
-        // Encode ID with length prefix
-        let id_bytes = bincode::serialize(&item.id)?;
-        dst.put_u32(id_bytes.len() as u32);
-        dst.extend_from_slice(&id_bytes);
-
-        // Encode Socket Address
-        Codec::encode_socket_addr(&item.sender, dst);
-
-        // Encode Timestamp with length prefix
-        let timestamp_bytes = bincode::serialize(&item.timestamp)?;
-        dst.put_u32(timestamp_bytes.len() as u32);
-        dst.extend_from_slice(&timestamp_bytes);
-
-        // Encode Payload with length prefix
-        let payload_bytes = Codec::serialize_payload(&item.payload)?;
-        dst.put_u32(payload_bytes.len() as u32); 
-        dst.extend_from_slice(&payload_bytes);
-
-        Ok(())
-    }
-}
-
-impl Decoder for MessageCodec {
-    type Item = Message;
-    type Error = anyhow::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Ensure we have at least one byte for the message type
-        if src.is_empty() {
-            return Ok(None);
+impl fmt::Display for MessageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MessageType::Ping => write!(f, "PING"),
+            MessageType::PingReq => write!(f, "PING_REQ"),
+            MessageType::Ack => write!(f, "ACK"),
+            MessageType::Join => write!(f, "JOIN"),
+            MessageType::Leave => write!(f, "LEAVE"),
+            MessageType::Dead => write!(f, "DEAD"),
+            MessageType::SyncReq => write!(f, "SYNC_REQ"),
+            MessageType::AppMsg => write!(f, "APP_MSG"),
         }
-        
-        let message_type = MessageType::from_u8(src.get_u8())?;
-        let id: String = Codec::read_length_prefixed(src)?;
-        let sender = Codec::decode_socket_addr(src)?;
-        let timestamp: u64 = Codec::read_length_prefixed(src)?;
-
-        let payload_len = Codec::read_bytes(src, 4)?.get_u32() as usize;
-        let payload_bytes = Codec::read_bytes(src, payload_len)?;
-       
-        let payload: MessagePayload = match message_type {
-            MessageType::Ping => MessagePayload::Ping(bincode::deserialize(&payload_bytes)?),
-            MessageType::PingReq => MessagePayload::PingReq(bincode::deserialize(&payload_bytes)?),
-            MessageType::Ack => MessagePayload::Ack(bincode::deserialize(&payload_bytes)?),
-            MessageType::Join => MessagePayload::Join(bincode::deserialize(&payload_bytes)?),
-            MessageType::Leave => MessagePayload::Leave(bincode::deserialize(&payload_bytes)?),
-            MessageType::Fail => MessagePayload::Fail(bincode::deserialize(&payload_bytes)?),
-            MessageType::Update => MessagePayload::Update(bincode::deserialize(&payload_bytes)?),
-            MessageType::AppMsg => MessagePayload::AppMsg(bincode::deserialize(&payload_bytes)?),
-        };
-
-        Ok(Some(Message {
-            id,
-            msg_type: message_type,
-            payload,
-            sender,
-            timestamp,
-        }))
     }
 }
+
 pub(crate) struct MessageBroker {
-    transport: Box<dyn NodeTransport>
+    transport: Box<dyn NodeTransport>,
 }
 
 impl MessageBroker {
     pub fn new(transport: Box<dyn NodeTransport>) -> Self {
-        Self { transport }
+        Self { 
+            transport,
+        }
     }
-
+    
     /// Sends a ping message to the target address
-    pub async fn send_ping(&self, sender: SocketAddr, target: SocketAddr) -> Result<()> {
-        let ping_payload = PingPayload { sequence_number: 1 };
+    pub async fn send_ping(&self, target: SocketAddr, sender: SocketAddr, sequence_number: u64, ping_timeout: Duration,  ack_timeout: Duration) -> Result<()> {
+        let ping_payload = PingPayload { 
+            sequence_number,
+        };
+
         let message = Message {
-            id: Uuid::new_v4().to_string(),
+            id: Uuid::new_v4(),
             msg_type: MessageType::Ping,
             payload: MessagePayload::Ping(ping_payload),
             sender,
@@ -228,9 +189,33 @@ impl MessageBroker {
         let mut buffer = BytesMut::new();
         codec.encode(message, &mut buffer)?;
 
-        let mut stream = self.transport.dial_tcp(target).await?;
-        self.transport.write_to_tcp(&mut stream, &buffer).await?;
+        // Send the PING message with timeout
+        timeout(ping_timeout, self.transport.write_to_udp(target, &buffer))
+            .await
+            .context("UDP write timed-out")?
+            .context("Failed to send PING message")?;
      
-        Ok(())
+        self.await_ping_ack(target, ack_timeout).await
+    }
+
+    /// wait for PING-ACK Message 
+    async fn await_ping_ack(&self, target: SocketAddr, timeout_duration: Duration) -> Result<()> {
+        let mut buf = [0u8; DEFAULT_MESSAGE_BUFFER_SIZE];
+        // TODO: Forward packet to handle_incoming if:
+        // 1. They are not from target address 
+        // 2. Not an ACK message
+        match timeout(timeout_duration, self.transport.recv_packet(&mut buf)).await {
+            Ok(Ok((_, addr))) if addr == target => {
+                let response = Message::from_vec(&buf)
+                    .context("Failed to decode response message")?;
+                match response.msg_type {
+                    MessageType::Ack => Ok(()),
+                    _ => Err(anyhow::anyhow!("Unexpected response type: {:?}", response.msg_type)),
+                }
+            }
+            Ok(Ok((_, addr))) => Err(anyhow::anyhow!("Response from unexpected address: {}", addr)),
+            Ok(Err(e)) => Err(e).context("Error receiving PING response"),
+            Err(_) => Err(anyhow::anyhow!("PING timed out")),
+        }
     }
 }

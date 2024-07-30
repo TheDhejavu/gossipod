@@ -24,7 +24,7 @@ impl From<&str> for IpAddress {
 }
 
 impl IpAddress {
-    /// find_system_ip finds system IP Address
+    /// finds system IP Address
     pub(crate) fn find_system_ip() -> Result<IpAddr> {
         let interfaces = get_if_addrs()?;
         for iface in interfaces {

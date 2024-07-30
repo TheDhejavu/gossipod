@@ -305,6 +305,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ecd4077b5ae9fd2e9e169b102c6c330d0605168eb0e8bf79952b256dbefffd"
 
 [[package]]
+name = "gossipod"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "env_logger",
+ "futures",
+ "gethostname",
+ "if-addrs",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -633,26 +653,6 @@ checksum = "ce305eb0b4296696835b71df73eb912e0f1ffd2556a501fcede6e0c50349191c"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "swim-rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bincode",
- "env_logger",
- "futures",
- "gethostname",
- "if-addrs",
- "log",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
