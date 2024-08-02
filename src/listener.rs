@@ -1,21 +1,31 @@
-use std::net::SocketAddr;
-use anyhow::{Context as _, Result};
+use std::{net::SocketAddr, sync::Arc};
+use anyhow::Result;
 use log::{error, info, warn};
-use tokio::{select, sync::broadcast};
-use crate::{message::{Message, MessageType}, transport::{Protocol, TransportChannel}, Gossipod};
+use tokio::{
+    net::{TcpStream, UdpSocket},
+    select,
+    sync::broadcast,
+};
+use crate::{
+    message::{Message, MessageType}, node::NodeMetadata, transport::{Transport, TransportChannel}, Gossipod
+};
 
-pub(crate) struct EventListener {
-    gossipod: Gossipod,
+pub(crate) struct EventListener<M: NodeMetadata> {
+    gossipod: Gossipod<M>,
     transport_channel: TransportChannel,
     shutdown: broadcast::Sender<()>,
 }
 
-impl EventListener {
+impl<M: NodeMetadata> EventListener<M> {
+    /// Creates a new EventListener instance.
+    ///
+    /// This listener will handle incoming TCP and UDP connections and process
+    /// messages according to the Gossipod protocol.
     pub(crate) fn new(
-        gossipod: Gossipod, 
+        gossipod: Gossipod<M>, 
         transport_channel: TransportChannel,
         shutdown: broadcast::Sender<()>,
-    ) -> EventListener {
+    ) -> Self {
         Self { 
             gossipod, 
             transport_channel,
@@ -23,6 +33,10 @@ impl EventListener {
         }
     }
 
+    /// Runs the main event loop for listening to incoming connections.
+    ///
+    /// This method will continuously listen for TCP and UDP connections
+    /// until a shutdown signal is received.
     pub(crate) async fn run_listeners(&mut self) -> Result<()> {
         info!("Starting Listener...");
         let mut shutdown_rx = self.shutdown.subscribe();
@@ -30,13 +44,13 @@ impl EventListener {
         loop {
             select! {
                 tcp_stream = self.transport_channel.tcp_stream_rx.recv() => {
-                    if let Some((addr, data)) = tcp_stream {
-                        self.spawn_incoming_handler(addr, data, Protocol::TCP).await;
+                    if let Some((addr, stream)) = tcp_stream {
+                        self.handle_stream(addr, stream).await?;
                     }
                 },
-                udp_packet = self.transport_channel.udp_packet_rx.recv() => {
-                    if let Some((addr, data)) = udp_packet {
-                        self.spawn_incoming_handler(addr, data, Protocol::UDP).await;
+                udp_socket = self.transport_channel.udp_socket_rx.recv() => {
+                    if let Some((addr, socket)) = udp_socket {
+                        self.handle_socket(addr, socket).await?;
                     }
                 },
                 _ = shutdown_rx.recv() => {
@@ -48,82 +62,75 @@ impl EventListener {
         Ok(())
     }
 
-    async fn spawn_incoming_handler(&self, addr: SocketAddr, data: Vec<u8>, protocol: Protocol) {
+    /// Handles incoming TCP stream connections.
+    ///
+    /// This method reads a message from the stream and processes it
+    /// based on its type.
+    async fn handle_stream(&self, addr: SocketAddr, mut stream: TcpStream) -> Result<()> {
         let gossipod = self.gossipod.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::handle_incoming(gossipod, addr, data, protocol.clone()).await {
-                error!("Error handling {} message: {:?}", protocol, e);
+            match Transport::read_stream(&mut stream).await {
+                Ok(message) => Self::process_tcp_stream(gossipod, stream, message, addr).await,
+                Err(e) => {
+                    error!("[ERR] error reading from stream ({}): {:?}", addr, e);
+                    Ok(())
+                },
             }
         });
+        Ok(())
     }
 
-    async fn handle_incoming(gossipod: Gossipod, addr: SocketAddr, data: Vec<u8>, protocol: Protocol) -> Result<()> {
-        // This decoding uses a generic MessageCodec. For a more granular approach where each 
-        // message type handles its own decoding/encoding, this method may not be suitable. 
-        // In such cases, we might pass the raw bytes and delegate decoding to the respective 
-        // message type handlers.
-        let message = Message::from_vec(&data)
-            .context(format!("Failed to decode {} message", protocol))?;
-        
-        info!("Received {} message from {}: {:?}", protocol, addr, message);
-        
-        Self::process_message(gossipod, addr, message, protocol).await
+    /// Handles incoming UDP socket connections.
+    ///
+    /// This method reads a message from the socket and processes it
+    /// based on its type.
+    async fn handle_socket(&self, addr: SocketAddr, socket: Vec<u8>) -> Result<()> {
+        let gossipod = self.gossipod.clone();
+        tokio::spawn(async move {
+            match Transport::read_socket(socket).await {
+                Ok(message) => Self::process_udp_packet(gossipod, message, addr).await,
+                Err(e) => {
+                    error!("[ERR] error reading from socket ({}): {:?}", addr, e);
+                    Ok(())
+                },
+            }
+        });
+        Ok(())
     }
-    
-    async fn process_message(gossipod: Gossipod, addr: SocketAddr, message: Message, protocol: Protocol) -> Result<()> {
-        match (message.msg_type, protocol.clone()) {
-            (MessageType::Ping, Protocol::UDP) => Self::handle_ping(gossipod, addr, message).await,
-            (MessageType::PingReq, Protocol::UDP) => Self::handle_ping_req(gossipod, addr, message).await,
-            (MessageType::Ack, Protocol::UDP) => Self::handle_ack(gossipod, addr, message).await,
-            (MessageType::Join, Protocol::TCP) => Self::handle_join(gossipod, addr, message).await,
-            (MessageType::Leave, Protocol::TCP) => Self::handle_leave(gossipod, addr, message).await,
-            (MessageType::Dead, Protocol::UDP) => Self::handle_dead(gossipod, addr, message).await,
-            (MessageType::SyncReq, Protocol::TCP) => Self::handle_sync_req(gossipod, addr, message).await,
-            (MessageType::AppMsg, Protocol::TCP) => Self::handle_app_msg(gossipod, addr, message).await,
+
+    /// Processes a received message based on its type.
+    ///
+    /// This method delegates the handling of different message types
+    /// to the appropriate methods in the Gossipod instance.
+    async fn process_tcp_stream(gossipod: Gossipod<M>, stream: TcpStream, message: Message, addr: SocketAddr) -> Result<()> {
+        match message.msg_type {
+            MessageType::SyncReq => gossipod.handle_sync_req(stream, message).await,
+            MessageType::AppMsg => gossipod.handle_app_msg(message).await,
             _ => {
-                warn!("Unexpected message type {} for protocol {}", message.msg_type, protocol);
+                warn!("[ERR] Unexpected message type {} for TCP from {}", message.msg_type, addr);
                 Ok(())
             }
         }
     }
 
-    async fn handle_ping(gossipod: Gossipod, addr: SocketAddr, message: Message) -> Result<()> {
-        info!("[UDP] Handling `PING` message with ID: {}", message.id);
-        unimplemented!()
-    }
-
-    async fn handle_join(gossipod: Gossipod, addr: SocketAddr, message: Message) -> Result<()> {
-        info!("[TCP] Handling `JOIN` message with ID: {}", message.id);
-        unimplemented!()
-    }
-
-    async fn handle_dead(gossipod: Gossipod, addr: SocketAddr, message: Message) -> Result<()> {
-        info!("[UDP] Handling `DEAD` message with ID: {}", message.id);
-        unimplemented!()
-    }
-
-    async fn handle_ping_req(gossipod: Gossipod, addr: SocketAddr, message: Message) -> Result<()> {
-        info!("[UDP] Handling `PING_REQ` message with ID: {}", message.id);
-        unimplemented!()
-    }
-
-    async fn handle_ack(gossipod: Gossipod, addr: SocketAddr, message: Message) -> Result<()> {
-        info!("[UDP] Handling `ACK` message with ID: {}", message.id);
-        unimplemented!()
-    }
-
-    async fn handle_leave(gossipod: Gossipod, addr: SocketAddr, message: Message) -> Result<()> {
-        info!("[TCP] Handling `LEAVE` message with ID: {}", message.id);
-        unimplemented!()
-    }
-
-    async fn handle_sync_req(gossipod: Gossipod, addr: SocketAddr, message: Message) -> Result<()> {
-        info!("[TCP] Handling `SYNC_REQ` message with ID: {}", message.id);
-        unimplemented!()
-    }
-
-    async fn handle_app_msg(gossipod: Gossipod, addr: SocketAddr, message: Message) -> Result<()> {
-        info!("[TCP] Handling `APP_MSG` message with ID: {}", message.id);
-        unimplemented!()
+    /// Processes a received UDP message based on its type.
+    async fn process_udp_packet(gossipod: Gossipod<M>, message: Message, addr: SocketAddr) -> Result<()> {
+        match message.msg_type {
+            MessageType::Ping => gossipod.handle_ping(message).await,
+            MessageType::PingReq => gossipod.handle_ping_req(message).await,
+            MessageType::Ack => gossipod.handle_ack(message).await,
+            MessageType::NoAck => gossipod.handle_no_ack(message).await,
+            MessageType::Broadcast => gossipod.handle_broadcast(message).await,
+            MessageType::AppMsg => gossipod.handle_app_msg(message).await,
+            MessageType::SyncReq => {
+                warn!("[ERR] Received SyncReq over UDP from {}, ignoring", addr);
+                Ok(())
+            },
+            MessageType::AppMsg => gossipod.handle_app_msg(message).await,
+            _ => {
+                warn!("[ERR] Unexpected message type {} for UDP from {}", message.msg_type, addr);
+                Ok(())
+            }
+        }
     }
 }

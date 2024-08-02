@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum NodeState {
+pub enum NodeState {
     Alive,
     Suspect,
     Dead,
     Unknown,
 }
+
 impl NodeState {
     /// Transition to the next state based on SWIM protocol rules
     pub(crate)  fn next_state(&self) -> Self {
@@ -18,7 +19,6 @@ impl NodeState {
             NodeState::Unknown => NodeState::Alive, 
         }
     }
-    
 
     /// Check if the state is considered active (Alive or Suspect)
     pub(crate)  fn is_active(&self) -> bool {

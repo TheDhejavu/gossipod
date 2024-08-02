@@ -8,19 +8,22 @@ use crate::ip_addr::IpAddress;
 
 pub(crate) const DEFAULT_IP_ADDR: &str = "127.0.0.1";
 pub(crate) const DEFAULT_PORT: u16 = 5870;
-pub(crate) const DEFAULT_PING_TIMEOUT: u64 = 1_000; 
-pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 1_000;
+pub(crate) const DEFAULT_PING_TIMEOUT: u64 = 10_000; 
+pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 10_000;
 pub(crate) const DEFAULT_GOSSIP_INTERVAL: u64 = 5_000; 
-pub(crate) const DEFAULT_PROBING_INTERVAL: u64 = 5_000; 
+pub(crate) const DEFAULT_PROBING_INTERVAL: u64 = 6_000; 
 pub(crate) const DEFAULT_SUSPECT_TIMEOUT: u64 = 10_000; 
 pub(crate) const DEFAULT_MESSAGE_BUFFER_SIZE: usize = 1_024; 
 pub(crate) const DEFAULT_TRANSPORT_TIMEOUT: u64 = 5_000;
 pub(crate) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 100;
 pub(crate) const MAX_RETRY_DELAY: u64 = 60; // in secs
 pub(crate) const MAX_CONSECUTIVE_FAILURES: u32 = 2;
+pub(crate) const MAX_MESSAGE_SIZE: usize = 135; 
+pub(crate) const MAX_UDP_PACKET_SIZE: usize = 65507; // Maximum size for a single UDP packet
+pub(crate) const BROADCAST_FANOUT: usize = 2; 
 
 #[derive(Debug, Clone)]
-pub(crate) struct GossipodConfig {
+pub struct GossipodConfig {
     pub(crate) name: String,
     pub(crate) port: u16,
     pub(crate) ip_addrs: Vec<IpAddr>,
@@ -52,7 +55,7 @@ impl GossipodConfig {
 
 // Configuration for SWIM protocol.
 #[derive(Debug, Clone)]
-pub(crate) struct GossipodConfigBuilder {
+pub struct GossipodConfigBuilder {
     /// Optional name for the node.
     pub(crate) name: Option<String>,
     
@@ -218,25 +221,25 @@ impl GossipodConfigBuilder {
     /// Validate the configuration to ensure all values are set.
     pub(crate) fn validate(&self) -> Result<()> {
         if self.ip_addrs.is_empty() {
-            anyhow::bail!("Bind address is not set");
+            anyhow::bail!("bind address is not set");
         }
         if self.port == 0 {
-            anyhow::bail!("Bind port is not set");
+            anyhow::bail!("bind port is not set");
         }
         if self.ping_timeout.as_millis() == 0 {
-            anyhow::bail!("Ping timeout is not set");
+            anyhow::bail!("ping timeout is not set");
         }
         if self.probing_interval.as_millis() == 0 {
-            anyhow::bail!("Probing timeout is not set");
+            anyhow::bail!("probing timeout is not set");
         }
         if self.ack_timeout.as_millis() == 0 {
-            anyhow::bail!("Ack timeout is not set");
+            anyhow::bail!("ack timeout is not set");
         }
         if self.gossip_interval.as_millis() == 0 {
-            anyhow::bail!("Gossip interval is not set");
+            anyhow::bail!("gossip interval is not set");
         }
         if self.suspect_timeout.as_millis() == 0 {
-            anyhow::bail!("Suspect timeout is not set");
+            anyhow::bail!("suspect timeout is not set");
         }
         Ok(())
     }

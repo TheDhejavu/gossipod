@@ -1,27 +1,42 @@
 // SWIM Protocol Message and Message Type.
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{anyhow, Result};
+use log::info;
 use serde::{Deserialize, Serialize};
-use tokio::time::timeout;
-use tokio_util::{bytes::BytesMut, codec::{Decoder as _, Encoder}};
+use tokio::net::TcpStream;
+use tokio_util::{bytes::BytesMut, codec::{Decoder, Encoder}};
 use uuid::Uuid;
 use core::fmt;
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
 
-use crate::{codec::MessageCodec, config::DEFAULT_MESSAGE_BUFFER_SIZE, transport::NodeTransport, NodeState};
+use crate::{codec::MessageCodec, node::{Node, NodeMetadata}, transport::{NodeTransport, Transport}, NodeState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PingPayload {
     pub sequence_number: u64,
+    pub piggybacked_updates: Vec<RemoteNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PingReqPayload {
     pub target: SocketAddr,
     pub sequence_number: u64,
+    pub piggybacked_updates: Vec<RemoteNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SuspectPayload {
+    pub target: SocketAddr,
+    pub sequence_number: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AckPayload {
+    pub sequence_number: u64,
+    pub piggybacked_updates: Vec<RemoteNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NoAckPayload {
     pub sequence_number: u64,
 }
 
@@ -37,30 +52,22 @@ pub(crate) struct LeavePayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DeadPayload {
+pub(crate) struct FailedPayload {
     pub node: String,
-    pub detected_by: String,
+    pub target: SocketAddr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SyncReqPayload {
-    pub node: String,
-    pub members: Vec<NodeEntry>,
+    pub sender: SocketAddr,
+    pub members: Vec<RemoteNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct NodeEntry {
+pub(crate) struct RemoteNode {
     pub name: String,
     pub address: SocketAddr,
-    pub region: Option<String>,
-    pub state: NodeState,
-    pub incarnation: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AnnouncePayload {
-    pub node: String,
-    pub address: SocketAddr,
+    pub metadata: Vec<u8>,
     pub state: NodeState,
     pub incarnation: u64,
 }
@@ -75,25 +82,49 @@ pub(crate) enum MessagePayload {
     Ping(PingPayload),
     PingReq(PingReqPayload),
     Ack(AckPayload),
-    Join(JoinPayload),
-    Leave(LeavePayload),
-    Dead(DeadPayload),
+    NoAck(NoAckPayload),
     SyncReq(SyncReqPayload),
     AppMsg(AppMsgPayload),
+    Broadcast(Broadcast),
 }
 
-// NOTES:
-// PING and PING-REQ wil be used for failure detections and information
-// dissemination , which means messages have to be piggybacked while we wait or we can 
-// create a future event that will wait for ack message based on sequence number within a time
-// frame. PIN or PING-REQ will happen via constant probing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum Broadcast {
+    Suspect { incarnation: u64, member: String },
+    Join { member: RemoteNode  },
+    Leave { incarnation: u64, member: String },
+    Confirm { incarnation: u64, member: String },
+    Alive { incarnation: u64, member: String },
+}
 
-// JOIN, when a node joins, it must specify a node, we will send a SYNC-REQ message to the target node
-// hoping to get a response via SYNC-RESP containing the memebership entry of the target node, thereby'
-// allowing us to perform a full-sync between the new node and the target node
-// if successful , the target node can create a broadcast notifying the nodes of a JOIN that cab 
-// be queued and bradcasted later to randomly selected nodes.
+impl Broadcast {
+    /// Returns a string representation of the broadcast type
+    fn type_str(&self) -> &'static str {
+        match self {
+            Broadcast::Suspect { .. } => "SUSPECT",
+            Broadcast::Join { .. } => "JOIN",
+            Broadcast::Leave { .. } => "LEAVE",
+            Broadcast::Confirm { .. } => "CONFIRM",
+            Broadcast::Alive { .. } => "ALIVE",
+        }
+    }
+}
 
+impl MessagePayload {
+    /// Serializes different types of payloads.
+    pub(crate) fn serialize(&self) -> Result<Vec<u8>, bincode::Error> {
+        match self {
+            MessagePayload::Ping(p) => bincode::serialize(p),
+            MessagePayload::PingReq(p) => bincode::serialize(p),
+            MessagePayload::Ack(p) => bincode::serialize(p),
+            MessagePayload::NoAck(p) => bincode::serialize(p),
+            MessagePayload::SyncReq(p) => bincode::serialize(p),
+            MessagePayload::Broadcast(p) => bincode::serialize(p),
+            MessagePayload::AppMsg(p) => bincode::serialize(p),
+        }
+    }
+
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Message {
@@ -119,11 +150,10 @@ pub enum MessageType {
     Ping = 0,
     PingReq = 1,
     Ack = 2,
-    Join = 3,
-    Leave = 4,
-    Dead = 5,
-    SyncReq = 6,
-    AppMsg = 7,
+    NoAck = 3,
+    SyncReq = 4,
+    AppMsg = 5,
+    Broadcast = 6,
 }
 
 impl MessageType {
@@ -132,11 +162,10 @@ impl MessageType {
             0 => Ok(MessageType::Ping),
             1 => Ok(MessageType::PingReq),
             2 => Ok(MessageType::Ack),
-            3 => Ok(MessageType::Join),
-            4 => Ok(MessageType::Leave),
-            5 => Ok(MessageType::Dead),
-            6 => Ok(MessageType::SyncReq),
-            7 => Ok(MessageType::AppMsg),
+            3 => Ok(MessageType::NoAck),
+            4 => Ok(MessageType::SyncReq),
+            5 => Ok(MessageType::AppMsg),
+            6 => Ok(MessageType::Broadcast),
             _ => Err(anyhow!("Invalid MessageType value: {}", value)),
         }
     }
@@ -148,74 +177,89 @@ impl fmt::Display for MessageType {
             MessageType::Ping => write!(f, "PING"),
             MessageType::PingReq => write!(f, "PING_REQ"),
             MessageType::Ack => write!(f, "ACK"),
-            MessageType::Join => write!(f, "JOIN"),
-            MessageType::Leave => write!(f, "LEAVE"),
-            MessageType::Dead => write!(f, "DEAD"),
+            MessageType::NoAck => write!(f, "NO_ACK"),
             MessageType::SyncReq => write!(f, "SYNC_REQ"),
             MessageType::AppMsg => write!(f, "APP_MSG"),
+            MessageType::Broadcast => write!(f, "BROADCAST"),
         }
     }
 }
 
-pub(crate) struct MessageBroker {
+pub(crate) struct NetSvc {
     transport: Box<dyn NodeTransport>,
 }
 
-impl MessageBroker {
+impl NetSvc {
+    /// Creates a new MessageBroker instance
     pub fn new(transport: Box<dyn NodeTransport>) -> Self {
-        Self { 
-            transport,
+        Self { transport }
+    }
+
+    /// Synchronizes state with a target node
+    pub async fn sync_state<T: NodeMetadata>(&self, target: SocketAddr, sender: SocketAddr, members: &[Node<T>]) -> Result<Vec<RemoteNode>> {
+        let mut stream = self.transport.dial_tcp(target).await?;
+        info!("Initiating sync state with: {}", target);
+    
+        self.send_sync_request(&mut stream, sender, members).await?;
+        self.receive_sync_response(&mut stream).await
+    }
+
+    /// Receives a sync response from a stream
+    async fn receive_sync_response(&self, stream: &mut TcpStream) -> Result<Vec<RemoteNode>> {
+        let message = Transport::read_stream(stream).await?;
+
+        match message.payload {
+            MessagePayload::SyncReq(payload) => Ok(payload.members),
+            _ => Err(anyhow!("unexpected message payload")),
         }
     }
-    
-    /// Sends a ping message to the target address
-    pub async fn send_ping(&self, target: SocketAddr, sender: SocketAddr, sequence_number: u64, ping_timeout: Duration,  ack_timeout: Duration) -> Result<()> {
-        let ping_payload = PingPayload { 
-            sequence_number,
+
+    /// Sends a sync request to a stream
+    pub async fn send_sync_request<M: NodeMetadata>(&self, stream: &mut TcpStream, sender: SocketAddr, members: &[Node<M>]) -> Result<()> {
+        let sync_payload = SyncReqPayload { 
+            sender,
+            members: members.iter()
+                .map(|member| {
+                    Ok(RemoteNode { 
+                        name: member.name.clone(), 
+                        address: member.socket_addr()?,
+                        state: member.state(),
+                        metadata: member.metadata.to_bytes()?,
+                        incarnation: member.incarnation(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         };
 
         let message = Message {
             id: Uuid::new_v4(),
-            msg_type: MessageType::Ping,
-            payload: MessagePayload::Ping(ping_payload),
+            msg_type: MessageType::SyncReq,
+            payload: MessagePayload::SyncReq(sync_payload),
             sender,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         };
         
         let mut codec = MessageCodec::new();
         let mut buffer = BytesMut::new();
         codec.encode(message, &mut buffer)?;
 
-        // Send the PING message with timeout
-        timeout(ping_timeout, self.transport.write_to_udp(target, &buffer))
-            .await
-            .context("UDP write timed-out")?
-            .context("Failed to send PING message")?;
-     
-        self.await_ping_ack(target, ack_timeout).await
+        self.transport.write_to_tcp(stream, &buffer).await
     }
 
-    /// wait for PING-ACK Message 
-    async fn await_ping_ack(&self, target: SocketAddr, timeout_duration: Duration) -> Result<()> {
-        let mut buf = [0u8; DEFAULT_MESSAGE_BUFFER_SIZE];
-        // TODO: Forward packet to handle_incoming if:
-        // 1. They are not from target address 
-        // 2. Not an ACK message
-        match timeout(timeout_duration, self.transport.recv_packet(&mut buf)).await {
-            Ok(Ok((_, addr))) if addr == target => {
-                let response = Message::from_vec(&buf)
-                    .context("Failed to decode response message")?;
-                match response.msg_type {
-                    MessageType::Ack => Ok(()),
-                    _ => Err(anyhow::anyhow!("Unexpected response type: {:?}", response.msg_type)),
-                }
-            }
-            Ok(Ok((_, addr))) => Err(anyhow::anyhow!("Response from unexpected address: {}", addr)),
-            Ok(Err(e)) => Err(e).context("Error receiving PING response"),
-            Err(_) => Err(anyhow::anyhow!("PING timed out")),
-        }
+    pub async fn broadcast(&self,  target: SocketAddr, sender: SocketAddr, broadcast: Broadcast) -> Result<()> {
+        let message = Message {
+            id: Uuid::new_v4(),
+            msg_type: MessageType::Broadcast,
+            payload: MessagePayload::Broadcast(broadcast.clone()),
+            sender,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        };
+
+        info!("Sending broadcast: {}", broadcast.type_str());
+        let mut codec = MessageCodec::new();
+        let mut buffer = BytesMut::new();
+        codec.encode(message, &mut buffer)?;
+
+        self.transport.write_to_udp(target,&buffer).await
     }
 }
