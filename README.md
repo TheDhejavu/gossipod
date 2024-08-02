@@ -2,9 +2,10 @@
 
 An Asynchronous SWIM protocol implementation written in Rust, providing out-of-the-box and extendable transport-layer communication via TCP and UDP based-off [SWIM Protocol Paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
 
-
 > [!WARNING]
-> This project is still a work in progress and should not be used in production yet.
+> **Disclaimer:** This project is a work in progress and not yet production-ready.
+> The codebase may contain bugs or incomplete features.
+> Use with caution. Feedback and contributions welcome, Thanks!.
 
 ## Proposed Key Features
 
