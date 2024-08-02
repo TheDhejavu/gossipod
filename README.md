@@ -2,11 +2,6 @@
 
 An Asynchronous SWIM protocol implementation written in Rust, providing out-of-the-box and extendable transport-layer communication via TCP and UDP based-off [SWIM Protocol Paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
 
-## Usecase
-the idea is to be able to provide out of the transport and extendable  transport-layer
-- for developers that have existing application with their communication layer
-- for developers that just want to use gossipod for everything including its communication layer. 
-
 
 > [!WARNING]
 > This project is still a work in progress and should not be used in production yet.
