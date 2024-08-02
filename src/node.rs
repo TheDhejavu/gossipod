@@ -13,7 +13,7 @@ use crate::state::NodeState;
 pub struct NodeStatus {
     incarnation: u64,
     pub state: NodeState,
-    last_updated: u64,
+    last_updated: u128,
 }
 
 impl NodeStatus {
@@ -32,7 +32,7 @@ impl NodeStatus {
         self.last_updated = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("unable to get time ")?
-            .as_secs();
+            .as_millis();
 
         Ok(())
     }
@@ -44,7 +44,7 @@ impl NodeStatus {
         self.last_updated = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("unable to get time ")?
-            .as_secs();
+            .as_millis();
 
         Ok(())
     }
@@ -300,7 +300,7 @@ impl<M: NodeMetadata> Node<M> {
             .expect("Time went backwards")
             .as_secs();
 
-        let time_in_suspect_state = now.saturating_sub(self.status.last_updated);
+        let time_in_suspect_state = now.saturating_sub(self.status.last_updated.try_into()?);
         
         Ok(time_in_suspect_state > timeout.as_secs())
     }
@@ -361,7 +361,7 @@ mod tests {
     fn test_node_without_metadata() {
         let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0,DefaultMetadata::new());
         
-        node.update_state(NodeState::Alive);
+        node.update_state(NodeState::Alive).expect("failed to update status to alive");
         
         assert_eq!(node.name, "node1");
         assert_eq!(node.port, 8000);
@@ -377,7 +377,7 @@ mod tests {
         };
 
         let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0,metadata);
-        node.update_state(NodeState::Alive);
+        node.update_state(NodeState::Alive).expect("should update state");
         
         assert_eq!(node.name, "node1");
         assert_eq!(node.port, 8000);
@@ -391,34 +391,39 @@ mod tests {
 
     #[test]
     fn test_node_merge() {
-        let mut prev_node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(),0, DefaultMetadata::new());
+        let mut prev_node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0, DefaultMetadata::new());
         
-        prev_node.update_state(NodeState::Alive);
+        prev_node.update_state(NodeState::Alive).expect("Failed to update prev_node state to Alive");
         let mut new_node = prev_node.clone();
-
+    
         // Test: Higher incarnation wins
-        prev_node.status.increment_incarnation();
-        new_node.update_state(NodeState::Suspect);
-        assert!(!prev_node.merge(&new_node).unwrap());
+        prev_node.status.increment_incarnation().expect("Failed to increment prev_node incarnation");
+        new_node.update_state(NodeState::Suspect).expect("Failed to update new_node state to Suspect");
+    
+        assert!(!prev_node.merge(&new_node).expect("Merge operation failed"));
         assert_eq!(prev_node.status.state, NodeState::Alive);
-
+    
         // Test: Equal incarnation, higher precedence state wins
-        prev_node.update_state(NodeState::Alive);
-        new_node.status.increment_incarnation();
-        new_node.update_state(NodeState::Dead);
-        assert!(prev_node.merge(&new_node).unwrap());
+        prev_node.update_state(NodeState::Alive).expect("Failed to update prev_node state to Alive");
+        new_node.status.increment_incarnation().expect("Failed to increment new_node incarnation");
+        new_node.update_state(NodeState::Dead).expect("Failed to update new_node state to Dead");
+    
+        assert!(prev_node.merge(&new_node).expect("Merge operation failed"));
         assert_eq!(new_node.status.state, NodeState::Dead);
-
+        assert_eq!(prev_node.status.state, NodeState::Dead);
+    
         // Test: Equal incarnation and state, more recent change wins
         std::thread::sleep(Duration::from_millis(10));
-        new_node.update_state(NodeState::Dead);
-        assert!(prev_node.merge(&new_node).unwrap());
-        assert!(prev_node.status.last_updated == new_node.status.last_updated);
-
+        assert_eq!(prev_node.status.incarnation, new_node.status.incarnation);
+        new_node.update_state(NodeState::Dead).expect("Failed to update new_node state to Dead");
+    
+        assert!(prev_node.merge(&new_node).expect("Merge operation failed"));
+        assert_eq!(prev_node.status.last_updated, new_node.status.last_updated);
+    
         // Test: Lower incarnation doesn't overwrite (no-op)
-        prev_node.status.increment_incarnation();
-        prev_node.update_state(NodeState::Alive);
-        assert!(!prev_node.merge(&new_node).unwrap());
+        prev_node.status.increment_incarnation().expect("Failed to increment prev_node incarnation");
+        prev_node.update_state(NodeState::Alive).expect("Failed to update prev_node state to Alive");
+        assert!(!prev_node.merge(&new_node).expect("Merge operation failed"));
         assert_eq!(prev_node.status.state, NodeState::Alive);
     }
 }
