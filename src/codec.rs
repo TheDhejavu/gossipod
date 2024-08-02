@@ -1,49 +1,35 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use anyhow::{anyhow, Result};
 use serde::de::DeserializeOwned;
-use tokio_util::bytes::{Buf as _, BufMut as _, BytesMut};
+use tokio_util::{bytes::{Buf, BufMut, BytesMut}, codec::{Decoder, Encoder}};
+use uuid::Uuid;
 
-use crate::message::MessagePayload;
-/*
- *
- * ===== Codec =====
- *
- */
-pub(crate) struct Codec;
+use crate::message::{Message, MessagePayload, MessageType};
 
-impl Codec {
-    // `read_bytes` read a fixed number of bytes
-    pub(crate) fn read_bytes(src: &mut BytesMut, len: usize) -> Result<BytesMut> {
-        if src.remaining() < len {
-            return Err(anyhow!("Buffer underflow: not enough data"));
-        }
-        Ok(src.split_to(len))
+pub(crate) struct MessageCodec;
+
+impl MessageCodec {
+    /// Creates a new MessageCodec instance.
+    pub(crate) fn new() -> Self {
+        MessageCodec
     }
 
-    // `read_length_prefixed` reads a length-prefixed field
+    /// Reads a fixed number of bytes from the source BytesMut.
+    pub(crate) fn read_bytes(src: &mut BytesMut, size: usize) -> Result<BytesMut> {
+        if src.remaining() < size {
+            return Err(anyhow!("buffer underflow: not enough data"));
+        }
+        Ok(src.split_to(size))
+    }
+
+    /// Reads length-prefixed data from the source BytesMut and deserializes it.
     pub(crate) fn read_length_prefixed<T: DeserializeOwned>(src: &mut BytesMut) -> Result<T> {
-        // First, read the length of the data, stored as a u32 (4 bytes).
-        // If successful, proceed to read the actual data based on this length.
-        let len = Codec::read_bytes(src, 4)?.get_u32() as usize;
-        let data = Codec::read_bytes(src, len)?;
+        let len = Self::read_bytes(src, 4)?.get_u32() as usize;
+        let data = Self::read_bytes(src, len)?;
         Ok(bincode::deserialize(&data)?)
     }
 
-    /// `serialize_payload` serialize different types of payloads
-    pub(crate) fn serialize_payload(payload: &MessagePayload) -> Result<Vec<u8>, bincode::Error> {
-        match payload {
-            MessagePayload::Ping(p) => bincode::serialize(p),
-            MessagePayload::PingReq(p) => bincode::serialize(p),
-            MessagePayload::Ack(p) => bincode::serialize(p),
-            MessagePayload::Join(p) => bincode::serialize(p),
-            MessagePayload::Leave(p) => bincode::serialize(p),
-            MessagePayload::Fail(p) => bincode::serialize(p),
-            MessagePayload::Update(p) => bincode::serialize(p),
-            MessagePayload::AppMsg(p) => bincode::serialize(p),
-        }
-    }
-
-    /// `encode_socket_addr` encode a SocketAddr into BytesMut
+    /// Encodes a SocketAddr into BytesMut.
     pub(crate) fn encode_socket_addr(addr: &SocketAddr, dst: &mut BytesMut) {
         match addr {
             SocketAddr::V4(addr_v4) => {
@@ -59,8 +45,8 @@ impl Codec {
         }
     }
 
-    /// `decode_socket_addr` decode a SocketAddr from BytesMut
-    pub(crate) fn decode_socket_addr(src: &mut BytesMut) -> Result<SocketAddr, anyhow::Error> {
+    /// Decodes a SocketAddr from BytesMut.
+    pub(crate) fn decode_socket_addr(src: &mut BytesMut) -> Result<SocketAddr> {
         let ip_type = src.get_u8();
         let ip_addr = match ip_type {
             4 => {
@@ -71,21 +57,84 @@ impl Codec {
                 let bytes = src.split_to(16);
                 IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[..])?))
             },
-            _ => return Err(anyhow!("Invalid IP type")),
+            _ => return Err(anyhow!("invalid IP type")),
         };
         let port = src.get_u16();
         Ok(SocketAddr::new(ip_addr, port))
     }
 }
 
+impl Encoder<Message> for MessageCodec {
+    type Error = anyhow::Error;
+
+    /// Encodes a `Message` into a `BytesMut` buffer for transmission.
+    ///
+    /// This encoding format ensures that independent data has its length set as prefix
+    /// for accurate decoding and reconstruction of data.
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.put_u8(item.msg_type as u8);
+        
+        let id_bytes = bincode::serialize(&item.id)?;
+        dst.put_u32(id_bytes.len() as u32);
+        dst.extend_from_slice(&id_bytes);
+
+        Self::encode_socket_addr(&item.sender, dst);
+
+        let timestamp_bytes = bincode::serialize(&item.timestamp)?;
+        dst.put_u32(timestamp_bytes.len() as u32);
+        dst.extend_from_slice(&timestamp_bytes);
+
+        let payload_bytes = item.payload.serialize()?;
+        dst.put_u32(payload_bytes.len() as u32);
+        dst.extend_from_slice(&payload_bytes);
+
+        Ok(())
+    }
+}
+
+impl Decoder for MessageCodec {
+    type Item = Message;
+    type Error = anyhow::Error;
+
+    /// Decodes a `Message` from a `BytesMut` buffer.
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.is_empty() {
+            return Ok(None);
+        }
+        
+        let message_type = MessageType::from_u8(src.get_u8())?;
+        let id: Uuid = Self::read_length_prefixed(src)?;
+        let sender = Self::decode_socket_addr(src)?;
+        let timestamp: u64 = Self::read_length_prefixed(src)?;
+
+        let payload_len = Self::read_bytes(src, 4)?.get_u32() as usize;
+        let payload_bytes = Self::read_bytes(src, payload_len)?;
+       
+        let payload: MessagePayload = match message_type {
+            MessageType::Ping => MessagePayload::Ping(bincode::deserialize(&payload_bytes)?),
+            MessageType::PingReq => MessagePayload::PingReq(bincode::deserialize(&payload_bytes)?),
+            MessageType::Ack => MessagePayload::Ack(bincode::deserialize(&payload_bytes)?),
+            MessageType::NoAck => MessagePayload::NoAck(bincode::deserialize(&payload_bytes)?),
+            MessageType::SyncReq => MessagePayload::SyncReq(bincode::deserialize(&payload_bytes)?),
+            MessageType::Broadcast => MessagePayload::Broadcast(bincode::deserialize(&payload_bytes)?),
+            MessageType::AppMsg => MessagePayload::AppMsg(bincode::deserialize(&payload_bytes)?),
+        };
+
+        Ok(Some(Message {
+            id,
+            msg_type: message_type,
+            payload,
+            sender,
+            timestamp,
+        }))
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use crate::message::PingPayload;
-
     use super::*;
+    use crate::message::{NoAckPayload, PingPayload};
     use serde::{Serialize, Deserialize};
-    use tokio_util::bytes::BytesMut;
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct TestPayload {
@@ -95,9 +144,8 @@ mod tests {
     #[test]
     fn test_read_bytes() {
         let mut src = BytesMut::from(&b"Hello"[..]);
-        assert_eq!(Codec::read_bytes(&mut src, 5).unwrap(), b"Hello"[..]);
-        // should error-out (buffer over flow)
-        assert!(Codec::read_bytes(&mut src, 1).is_err());
+        assert_eq!(MessageCodec::read_bytes(&mut src, 5).unwrap(), b"Hello"[..]);
+        assert!(MessageCodec::read_bytes(&mut src, 1).is_err());
     }
 
     #[test]
@@ -108,41 +156,30 @@ mod tests {
         buffer.put_u32(payload_bytes.len() as u32);
         buffer.extend_from_slice(&payload_bytes);
 
-        let decoded_payload: TestPayload = Codec::read_length_prefixed(&mut buffer).unwrap();
+        let decoded_payload: TestPayload = MessageCodec::read_length_prefixed(&mut buffer).unwrap();
         assert_eq!(decoded_payload, payload);
     }
 
     #[test]
-    fn test_encode_and_decode_socket_addr_ipv4() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let mut dst = BytesMut::new();
-        Codec::encode_socket_addr(&addr, &mut dst);
+    fn test_encode_and_decode_socket_addr() {
+        let addrs = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080),
+        ];
 
-        let mut src = dst.clone();
-        let decoded_addr = Codec::decode_socket_addr(&mut src).unwrap();
-        assert_eq!(decoded_addr, addr);
-    }
-
-    #[test]
-    fn test_encode_and_decode_socket_addr_ipv6() {
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080);
-        let mut dst = BytesMut::new();
-        // encode
-        Codec::encode_socket_addr(&addr, &mut dst);
-
-        // decode
-        let mut src = dst.clone();
-        let decoded_addr = Codec::decode_socket_addr(&mut src).unwrap();
-       
-        // assert equality 
-        assert_eq!(decoded_addr, addr);
+        for addr in addrs {
+            let mut dst = BytesMut::new();
+            MessageCodec::encode_socket_addr(&addr, &mut dst);
+            let decoded_addr = MessageCodec::decode_socket_addr(&mut dst).unwrap();
+            assert_eq!(decoded_addr, addr);
+        }
     }
 
     #[test]
     fn test_serialize_payload() {
-        let payload = MessagePayload::Ping(PingPayload{ sequence_number: 1 });
-        let serialized = Codec::serialize_payload(&payload).unwrap();
-        let expected_bytes = bincode::serialize(&PingPayload{ sequence_number: 1 }).unwrap();
+        let payload = MessagePayload::NoAck(NoAckPayload{ sequence_number: 1 });
+        let serialized = payload.serialize().unwrap();
+        let expected_bytes = bincode::serialize(&NoAckPayload{ sequence_number: 1 }).unwrap();
         assert_eq!(serialized, expected_bytes);
     }
 }
