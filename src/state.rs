@@ -6,6 +6,8 @@ pub enum NodeState {
     Alive,
     Suspect,
     Dead,
+    Leaving,
+    Left,
     Unknown,
 }
 
@@ -16,6 +18,8 @@ impl NodeState {
             NodeState::Alive => NodeState::Suspect,
             NodeState::Suspect => NodeState::Dead,
             NodeState::Dead => NodeState::Dead, 
+            NodeState::Leaving => NodeState::Leaving, 
+            NodeState::Left => NodeState::Left, 
             NodeState::Unknown => NodeState::Alive, 
         }
     }
@@ -31,6 +35,8 @@ impl NodeState {
             "alive" => Some(NodeState::Alive),
             "suspect" => Some(NodeState::Suspect),
             "dead" => Some(NodeState::Dead),
+            "leaving" => Some(NodeState::Leaving),
+            "left" => Some(NodeState::Left),
             "unknown" => Some(NodeState::Unknown),
             _ => None,
         }
@@ -38,7 +44,9 @@ impl NodeState {
 
     pub(crate) fn precedence(&self) -> u8 {
         match self {
-            NodeState::Dead => 3,
+            NodeState::Dead => 5,
+            NodeState::Left => 4,
+            NodeState::Leaving => 3,
             NodeState::Suspect => 2,
             NodeState::Alive => 1,
             NodeState::Unknown => 0,
@@ -58,6 +66,8 @@ impl fmt::Display for NodeState {
             NodeState::Alive => write!(f, "Alive"),
             NodeState::Suspect => write!(f, "Suspect"),
             NodeState::Dead => write!(f, "Dead"),
+            NodeState::Leaving => write!(f, "Leaving"),
+            NodeState::Left => write!(f, "Left"),
             NodeState::Unknown => write!(f, "Unknown"),
         }
     }

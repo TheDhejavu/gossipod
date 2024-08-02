@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
+use log::warn;
 use serde::{Serialize, Deserialize};
 use sysinfo::System;
 use std::cmp::Ordering;
@@ -254,14 +255,46 @@ impl<M: NodeMetadata> Node<M> {
         self.status.state = self.status.state.next_state();
     }
 
+     /// Advances the Node to the next state.
+    pub(crate) fn set_incarnation(&mut self, incarnation: u64) {
+        self.status.incarnation = incarnation;
+    }
+
     /// Returns incarnation number of the node
     pub(crate) fn incarnation(&self) -> u64 {
         self.status.incarnation
     }
 
-    /// Merges the state of another Node into this Node.
-    /// Returns true if any changes were made.
+    // Merges the state of another Node into this Node.
+    ///
+    /// This function is the central point for handling conflicting data between nodes.
+    /// It resolves conflicts based on the following rules:
+    /// 1. If the other node has a higher incarnation, all its data is adopted.
+    /// 2. If incarnations are equal, the node with the higher precedence state wins.
+    /// 3. If states are equal, the node with the most recent update wins.
+    ///
+    /// This is slightly deviated a little bit from the original SWIM paper that 
+    /// mostly resolve conflicting data based on incarnation number alone, this is subject to
+    /// improvement after thorough testing.
+    /// 
+    /// The function also handles metadata, IP address, and port changes.
+    /// Logs warnings for any detected differences in IP address, port, or metadata.
     pub fn merge(&mut self, other: &Node<M>) -> Result<bool> {
+        // Check for IP address differences
+        if self.ip_addr != other.ip_addr {
+            warn!("IP address changed from {} to {}", self.ip_addr, other.ip_addr);
+        }
+
+        // Check for port differences
+        if self.port != other.port {
+            warn!("Port changed from {} to {}", self.port, other.port);
+        }
+
+        // Check for metadata differences
+        if self.metadata != other.metadata {
+            warn!("Metadata has changed");
+        }
+
         let self_status = &mut self.status;
         let other_status = &other.status;
 
@@ -269,6 +302,8 @@ impl<M: NodeMetadata> Node<M> {
             Ordering::Less => {
                 *self_status = other_status.clone();
                 self.metadata = other.metadata.clone();
+                self.ip_addr = other.ip_addr;
+                self.port = other.port;
                 Ok(true)
             }
             Ordering::Equal => {
@@ -276,10 +311,14 @@ impl<M: NodeMetadata> Node<M> {
                     self_status.update_state(other_status.state.clone())?;
                     self_status.last_updated = other_status.last_updated;
                     self.metadata = other.metadata.clone();
+                    self.ip_addr = other.ip_addr;
+                    self.port = other.port;
                     Ok(true)
                 } else if other_status.state == self_status.state && other_status.last_updated > self_status.last_updated {
                     self_status.last_updated = other_status.last_updated;
                     self.metadata = other.metadata.clone();
+                    self.ip_addr = other.ip_addr;
+                    self.port = other.port;
                     Ok(true)
                 } else {
                     Ok(false)

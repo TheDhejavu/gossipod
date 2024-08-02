@@ -6,16 +6,18 @@ use crate::node::{Node, NodeMetadata};
 use crate::state::NodeState;
 
 #[derive(Debug)]
-pub(crate) struct MembershipList<M: NodeMetadata> {
+pub(crate) struct Membership<M: NodeMetadata> {
     nodes: Arc<RwLock<HashMap<String, Node<M>>>>,
     current_index: AtomicUsize,
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum MergeAction {
+pub enum MergeAction {
     Added,
     Updated,
     Unchanged,
+    Removed,
+    Ignored,
 }
 
 #[derive(Debug)]
@@ -25,7 +27,7 @@ pub(crate) struct MergeResult {
     pub new_state: NodeState,
 }
 
-impl<M: NodeMetadata> MembershipList<M> {
+impl<M: NodeMetadata> Membership<M> {
     /// Creates a new, empty Membership list.
     pub(crate) fn new() -> Self {
         Self {
@@ -155,6 +157,16 @@ impl<M: NodeMetadata> MembershipList<M> {
                 let old_state = existing_node.state();
                 let changed = existing_node.merge(other_node)?;
                 let new_state = existing_node.state();
+
+                // Check if the node is leaving or has left
+                if changed && matches!(new_state, NodeState::Leaving | NodeState::Left) {
+                    nodes.remove(&other_node.name);
+                    return Ok(MergeResult {
+                        action: MergeAction::Removed,
+                        old_state: Some(old_state),
+                        new_state,
+                    });
+                }
                 
                 Ok(MergeResult {
                     action: if changed { MergeAction::Updated } else { MergeAction::Unchanged },
@@ -162,6 +174,15 @@ impl<M: NodeMetadata> MembershipList<M> {
                     new_state,
                 })
             } else {
+                // Don't add the node if it's already in a leaving or left state
+                if matches!(other_node.state(), NodeState::Leaving | NodeState::Left) {
+                    return Ok(MergeResult {
+                        action: MergeAction::Ignored,
+                        old_state: None,
+                        new_state: other_node.state(),
+                    });
+                }
+
                 nodes.insert(other_node.name.clone(), other_node.clone());
                 Ok(MergeResult {
                     action: MergeAction::Added,
@@ -190,5 +211,55 @@ impl<M: NodeMetadata> MembershipList<M> {
         let mut nodes = self.nodes.write()
             .map_err(|e| anyhow!("unable to acquire lock: {}", e))?;
         f(&mut nodes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use crate::DefaultMetadata;
+
+    use super::*;
+
+   
+    #[test]
+    fn test_merge_add_node() {
+        let membership = Membership::new();
+        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0,DefaultMetadata::new());
+        node.update_state(NodeState::Alive).expect("unable to update node state");
+
+        let result = membership.merge(&node).unwrap();
+        assert_eq!(result.action, MergeAction::Added);
+        assert_eq!(result.old_state, None);
+        assert_eq!(result.new_state, NodeState::Alive);
+    }
+
+    #[test]
+    fn test_merge_ignore_leaving_node() {
+        let membership = Membership::new();
+        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0,DefaultMetadata::new());
+        node.update_state(NodeState::Leaving).expect("unable to update node state");
+
+        let result = membership.merge(&node).unwrap();
+        assert_eq!(result.action, MergeAction::Ignored);
+        assert_eq!(result.old_state, None);
+        assert_eq!(result.new_state, NodeState::Leaving);
+    }
+
+    #[test]
+    fn test_merge_remove_leaving_node() {
+        let membership = Membership::new();
+        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0,DefaultMetadata::new());
+        node.update_state(NodeState::Alive).expect("unable to update node state");
+        membership.add_node(node.clone()).expect("unable to add node");
+
+        let mut new_node = node.clone();
+        new_node.update_state(NodeState::Leaving).expect("unable to update node state");
+        
+        let result = membership.merge(&new_node).unwrap();
+        assert_eq!(result.action, MergeAction::Removed);
+        assert_eq!(result.old_state, Some(NodeState::Alive));
+        assert_eq!(result.new_state, NodeState::Leaving);
     }
 }

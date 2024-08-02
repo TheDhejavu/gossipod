@@ -18,7 +18,7 @@ use crate::{
     event::EventManager,
     ip_addr::IpAddress,
     listener::EventListener,
-    members::MembershipList,
+    members::Membership,
     message::{Message, NetSvc, RemoteNode},
     node::Node,
     retry_state::RetryState,
@@ -52,7 +52,7 @@ mod utils;
 /// * Listeners: Network event processors that handle incoming TCP and UDP connections
 /// and process messages according to the Gossipod protocol.
 ///
-/// * MembershipList: Local membership state manager that manages membership 
+/// * Membership: Local membership state manager that manages membership 
 /// information changes through a single 'merge' entry point. It compares existing 
 /// data with new data and applies necessary updates.
 ///
@@ -115,7 +115,7 @@ pub(crate) struct InnerGossipod<M: NodeMetadata>  {
 
     /// Map of all known members and their current state.
     /// Each node maintains information about all other nodes.
-    members: MembershipList<M>,
+    members: Membership<M>,
 
     /// Communication layer for sending and receiving messages
     transport: Transport,
@@ -132,7 +132,7 @@ pub(crate) struct InnerGossipod<M: NodeMetadata>  {
     /// Incarnation number, used to detect and handle node restarts
     incarnation: AtomicU64,
 
-    /// Manager for handling and ceating of events
+    /// Manager for handling and creating of events
     event_manager: EventManager,
 
     /// Counter for synchronization requests
@@ -152,6 +152,7 @@ impl<M: NodeMetadata> Clone for Gossipod<M>{
 }
 
 impl Gossipod {
+    /// Creates a new instance of Gossipod with the default metadata.
     pub async fn new(config: GossipodConfig) -> Result<Self> {
         Gossipod::with_metadata(config, DefaultMetadata::new()).await
     }
@@ -159,6 +160,7 @@ impl Gossipod {
 
 
 impl<M: NodeMetadata> Gossipod<M> {
+    /// Creates a new instance of Gossipod with the provided metadata.
     pub async fn with_metadata(config: GossipodConfig, metadata: M) -> Result<Self> {
         env_logger::Builder::new()
             .filter_level(::log::LevelFilter::Info) 
@@ -179,7 +181,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                 config,
                 net_svc,
                 metadata,
-                members: MembershipList::new(),
+                members: Membership::new(),
                 state: RwLock::new(GossipodState::Idle),
                 shutdown: shutdown_tx.clone(),
                 transport,
@@ -255,6 +257,7 @@ impl<M: NodeMetadata> Gossipod<M> {
     
         self.set_state(GossipodState::Stopped).await?;
         self.inner.event_manager.shutdown().await?;
+        self.leave().await?;
 
         info!("[GOSSIPOD] Gracefully shut down due to {:?}", shutdown_reason);
     
@@ -495,9 +498,33 @@ impl<M: NodeMetadata> Gossipod<M> {
     }
 
     /// Gossipod LEAVE - Notifies nodes of a peer leaving 
-    pub async fn leave(&mut self) {
+    pub async fn leave(&self) -> Result<()> {
         debug!("LEAVING");
-        unimplemented!()
+        let incarnation = self.next_incarnation();
+        let local_node = self.get_local_node().await?;
+        let local_addr = local_node.socket_addr()?;
+        let broadcast = Broadcast::Leave {  
+            member: local_node.name,
+            incarnation,
+        };
+
+        // Broadcast leave message to a subset of known nodes (if any)
+        let known_nodes = self.inner.members.select_random_nodes(BROADCAST_FANOUT, Some(|n: &Node<M>| {
+            if let Ok(addr) = n.socket_addr() {
+                return !n.is_alive() || addr == local_addr
+            }
+            false
+        })).unwrap_or_default();
+
+        for node in &known_nodes {
+            if let Err(e) = self.inner.net_svc.broadcast(node.socket_addr()?, local_addr, broadcast.clone()).await {
+                warn!("failed to broadcast join message to {}: {}", node.name, e);
+            }
+        }
+
+        debug!("Leave broadcast sent to {} nodes", known_nodes.len());
+        Ok(())
+
     }
 
     async fn handle_ping(&self, message: Message) -> Result<()> {
@@ -555,148 +582,78 @@ impl<M: NodeMetadata> Gossipod<M> {
         }
     }
 
-    async fn handle_suspect_node(&self, incarnation: u64, member: &str) -> Result<()> {
-        Ok(())
-    }
-    async fn set_local_node_liveness(&self) -> Result<()> {
-        let ip_addr = self.inner.config.addr();
-        let name = self.inner.config.name();
-        let port = self.inner.config.port();
-        let incarnation = self.next_incarnation();
-        let mut node = Node::new(ip_addr, port, name.clone(), incarnation, self.inner.metadata.clone());
-        node.update_state(NodeState::Alive)?;
+    pub(crate) async fn handle_suspect_node(&self, incarnation: u64, member: &str) -> Result<()> {
+        let mut node = match self.inner.members.get_node(member)? {
+            Some(n) => n,
+            None => {
+                warn!("Received suspect message for unknown node: {}", member);
+                return Ok(());
+            }
+        };
+
+        // If the suspect message is about ourselves, we need to refute it
+        if member == self.inner.config.name() {
+            return self.refute_suspicion(incarnation).await;
+        }
 
         match self.inner.members.merge(&node) {
             Ok(merge_result) => {
                 match merge_result.action {
-                    MergeAction::Added => {
-                        debug!("Added new node {} to alive state with incarnation {}", name, incarnation);
-                    },
                     MergeAction::Updated => {
-                        info!("Updated existing node {} to alive state with new incarnation {}", name, incarnation);
-                        if let Some(old_state) = merge_result.old_state {
-                            debug!("Node {} state changed from {:?} to {:?}", name, old_state, merge_result.new_state);
-                        }
+                        info!("Node {} is now suspected", member);
+                        self.disseminate_suspect(node).await?;
                     },
                     MergeAction::Unchanged => {
-                        info!("No changes for node {}. Current state: {:?}, incarnation: {}", 
-                               name, merge_result.new_state, incarnation);
+                        debug!("Node {} was already suspected", member);
                     },
+                    _ => {
+                        warn!("Unexpected merge result when suspecting node {}", member);
+                    }
                 }
             },
             Err(e) => {
-                info!("Unable to merge node {}: {}", name, e);
+                info!("Unable to merge node {}: {}", member, e);
             },
         }
 
         Ok(())
     }
 
-    pub(crate) async fn handle_join_node(&self, member: RemoteNode) -> Result<()> {
-        let metadata = M::from_bytes(&member.metadata)
-            .context("Failed to deserialize node metadata")?;
-    
-        let new_node = Node::new(
-            member.address.ip(),
-            member.address.port(),
-            member.name.clone(),
-            member.incarnation,
-            metadata
-        ).with_state(member.state);
+    async fn refute_suspicion(&self, incarnation: u64) -> Result<()> {
+        let mut local_node = self.get_local_node().await?;
+        
+        // Only refute if the suspicion is for our current or future incarnation
+        if incarnation >= local_node.incarnation() {
+            let next_incarnation = self.next_incarnation();
+            local_node.set_incarnation(next_incarnation);
+            local_node.update_state(NodeState::Alive)?;
 
-        debug!("Processing join for node: {:?}", new_node);
+            info!("Refuting suspicion with new incarnation: {}", local_node.incarnation());
 
-        // Attempt to merge the new node into our membership list
-        match self.inner.members.merge(&new_node) {
-            Ok(merge_result) => {
-                match merge_result.action {
-                    MergeAction::Added => {
-                        info!("Added new node {} to the cluster", member.name);
-                        self.disseminate(new_node).await?;
-                    },
-                    MergeAction::Updated => {
-                        info!("Updated existing node {} in the cluster", member.name);
-                        if let Some(old_state) = merge_result.old_state {
-                            debug!("Node {} state changed from {:?} to {:?}", 
-                                   member.name, old_state, merge_result.new_state);
-                        }
-                        self.disseminate(new_node).await?;
-                    },
-                    MergeAction::Unchanged => {
-                        debug!("No changes for node {} in the cluster", member.name);
-                    },
-                }
-            },
-            Err(e) => {
-                warn!("Failed to merge node {} into cluster: {}", member.name, e);
-                return Err(e.into());
-            }
+            self.inner.members.merge(&local_node)?;
+            self.disseminate_alive(local_node).await?;
         }
 
-        debug!("{}", pretty_debug("Membership:", &self.inner.members.get_all_nodes()?));
-
         Ok(())
     }
 
-    async fn handle_leave_node(&self, incarnation: u64, member: &str) -> Result<()> {
-        Ok(())
-    }
-
-    async fn handle_confirm_node(&self, incarnation: u64, member: &str) -> Result<()> {
-        Ok(())
-    }
-
-    async fn handle_alive_node(&self, incarnation: u64, member: &str) -> Result<()> {
-        Ok(())
-    }
-
-    async fn handle_sync_req(&self, mut stream: TcpStream,message: Message) -> Result<()> {
-        debug!("HANDLE-SYNC-REQ");
-        Ok(())
-    }
-
-    /// Notifies nodes of a peer joining the network
-    pub async fn join(&self, target: SocketAddr) -> Result<()> {
-        debug!("Initiating join process with initial target: {}", target);
-
-        let incarnation = self.next_incarnation();
-        let local_node = self.get_local_node().await?;
-        let local_addr = local_node.socket_addr()?;
-        let broadcast = Broadcast::Join {  
-            member: RemoteNode { 
-                name: local_node.name.clone(),
-                address: local_addr,
-                metadata: local_node.metadata.to_bytes()?, 
-                state: local_node.state().clone(), 
-                incarnation,
-            },
+    async fn disseminate_alive(&self, node: Node<M>) -> Result<()> {
+        let broadcast = Broadcast::Alive {
+            incarnation: node.incarnation(),
+            member: node.name.clone(),
         };
-
-
-        self.inner.net_svc.broadcast(target, local_addr, broadcast.clone()).await
-            .context("failed to send join broadcast to initial contact")?;
-
-        // Broadcast join message to a subset of known nodes (if any)
-        let known_nodes = self.inner.members.select_random_nodes(BROADCAST_FANOUT, Some(|n: &Node<M>| {
-            if let Ok(addr) = n.socket_addr() {
-                return !n.is_alive() || addr == target || addr == local_addr
-            }
-            false
-        })).unwrap_or_default();
-
-        for node in &known_nodes {
-            if let Err(e) = self.inner.net_svc.broadcast(node.socket_addr()?, local_addr, broadcast.clone()).await {
-                warn!("failed to broadcast join message to {}: {}", node.name, e);
-            }
-        }
-
-        debug!("Join broadcast sent to initial contact and {} other nodes", known_nodes.len());
-        debug!("{}", pretty_debug("Membership:", &self.inner.members.get_all_nodes()?));
-
-        Ok(())
+        self.broadcast_to_random_nodes(broadcast).await
     }
 
-    async fn disseminate(&self, node: Node<M>) -> Result<()> {
+    async fn disseminate_suspect(&self, node: Node<M>) -> Result<()> {
+        let broadcast = Broadcast::Suspect {
+            incarnation: node.incarnation(),
+            member: node.name.clone(),
+        };
+        self.broadcast_to_random_nodes(broadcast).await
+    }
+
+    async fn disseminate_join(&self, node: Node<M>) -> Result<()> {
         let broadcast = Broadcast::Join {  
             member: RemoteNode { 
                 name: node.name.clone(), 
@@ -723,6 +680,323 @@ impl<M: NodeMetadata> Gossipod<M> {
         }
 
         info!("Join dissemination sent to known nodes {}", known_nodes.len());
+
+        Ok(())
+    }
+
+    async fn confirm_node_dead(&self, node: &Node<M>) -> Result<()> {
+        let mut updated_node = node.clone();
+        updated_node.update_state(NodeState::Dead)?;
+        
+        let broadcast = Broadcast::Confirm {
+            incarnation: node.incarnation(),
+            member: node.name.clone(),
+        };
+        self.broadcast_to_random_nodes(broadcast).await
+    }
+
+    async fn set_local_node_liveness(&self) -> Result<()> {
+        let ip_addr = self.inner.config.addr();
+        let name = self.inner.config.name();
+        let port = self.inner.config.port();
+        let incarnation = self.next_incarnation();
+        let mut node = Node::new(ip_addr, port, name.clone(), incarnation, self.inner.metadata.clone());
+        node.update_state(NodeState::Alive)?;
+
+        match self.inner.members.merge(&node) {
+            Ok(merge_result) => {
+                match merge_result.action {
+                    MergeAction::Added => {
+                        debug!("Added new node {} to alive state with incarnation {}", name, incarnation);
+                    },
+                    MergeAction::Updated => {
+                        info!("Updated existing node {} to alive state with new incarnation {}", name, incarnation);
+                        if let Some(old_state) = merge_result.old_state {
+                            debug!("Node {} state changed from {:?} to {:?}", name, old_state, merge_result.new_state);
+                        }
+                    },
+                    MergeAction::Unchanged => {
+                        info!("No changes for node {}. Current state: {:?}, incarnation: {}", 
+                               name, merge_result.new_state, incarnation);
+                    },
+                    _ => {}
+                }
+            },
+            Err(e) => {
+                info!("Unable to merge node {}: {}", name, e);
+            },
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn handle_join_node(&self, member: RemoteNode) -> Result<()> {
+        let metadata = M::from_bytes(&member.metadata)
+            .context("Failed to deserialize node metadata")?;
+    
+        let mut new_node = Node::new(
+            member.address.ip(),
+            member.address.port(),
+            member.name.clone(),
+            member.incarnation,
+            metadata
+        );
+        new_node.update_state(member.state)?;
+
+        debug!("Processing join for node: {:?}", new_node);
+
+        // Attempt to merge the new node into our membership list
+        match self.inner.members.merge(&new_node) {
+            Ok(merge_result) => {
+                match merge_result.action {
+                    MergeAction::Added => {
+                        info!("Added new node {} to the cluster", member.name);
+                        self.disseminate_join(new_node).await?;
+                    },
+                    MergeAction::Updated => {
+                        info!("Updated existing node {} in the cluster", member.name);
+                        if let Some(old_state) = merge_result.old_state {
+                            if old_state != merge_result.new_state {
+                                debug!(
+                                    "Node {} state changed from {:?} to {:?}",
+                                    member.name, old_state, merge_result.new_state
+                                );
+                            }
+                        }
+                        
+                        self.disseminate_join(new_node).await?;
+                    },
+                    MergeAction::Unchanged => {
+                        debug!("No changes for node {} in the cluster", member.name);
+                    },
+                    _ => {}
+                }
+            },
+            Err(e) => {
+                warn!("Failed to merge node {} into cluster: {}", member.name, e);
+                return Err(e.into());
+            }
+        }
+
+        debug!("{}", pretty_debug("Membership:", &self.inner.members.get_all_nodes()?));
+
+        Ok(())
+    }
+
+    async fn handle_leave_node(&self, incarnation: u64, member: &str) -> Result<()> {
+        if let Ok(Some(node)) = self.inner.members.get_node(member) {
+            match self.inner.members.merge(&node) {
+                Ok(merge_result) => {
+                    match merge_result.action {
+                        MergeAction::Removed => {
+                            info!("State changed({:?}) for node {} in the cluster", merge_result.action , node.name);
+                            // Hiya!!, There is an increasing number of repetitive stuff like this, i might as well
+                            // just have a Queue that a task picks from that constantly disseminate this broadcast
+                            
+                            // Broadcast leave message to a subset of known nodes (if any)
+                            let broadcast = Broadcast::Leave {  
+                                incarnation,
+                                member: member.to_string(),
+                            };
+                            self.broadcast_to_random_nodes(broadcast).await?;
+                        },
+                        MergeAction::Unchanged => {
+                            debug!("No changes for node {} in the cluster", node.name);
+                        },
+                        _ => {}
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to merge node {} into cluster: {}", node.name, e);
+                }
+            }
+        } else {
+            warn!("[WARN] node with name {} does not exist", member);
+        }
+        
+        Ok(())
+    }
+
+    async fn handle_confirm_node(&self, incarnation: u64, member: &str) -> Result<()> {
+        let local_node = self.get_local_node().await?;
+
+        // If it's about us, we need to refute
+        if member == local_node.name {
+            return self.refute_node().await;
+        }
+
+        if let Ok(Some(mut node)) = self.inner.members.get_node(member) {
+            // Update the node state to Dead
+            node.update_state(NodeState::Dead)?;
+            node.set_incarnation(incarnation);
+
+            match self.inner.members.merge(&node) {
+                Ok(merge_result) => {
+                    match merge_result.action {
+                        MergeAction::Updated => {
+                            info!("Node {} confirmed dead. Updating state.", node.name);
+                            let broadcast = Broadcast::Confirm {  
+                                incarnation,
+                                member: member.to_string(),
+                            };
+                            self.broadcast_to_random_nodes(broadcast).await?;
+                        },
+                        MergeAction::Unchanged => {
+                            debug!("No changes for node {} in the cluster", node.name);
+                        },
+                        _ => {}
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to merge node {} into cluster: {}", node.name, e);
+                }
+            }
+        } else {
+            warn!("[WARN] node with name {} does not exist", member);
+        }
+        
+        Ok(())
+    }
+
+    async fn refute_node(&self) -> Result<()> {
+        let local_node = self.get_local_node().await?;
+        let new_incarnation = self.next_incarnation();
+        
+        // Create an updated node with the new incarnation number
+        let mut updated_node = local_node.clone();
+        updated_node.set_incarnation(new_incarnation);
+        updated_node.update_state(NodeState::Alive)?;
+
+        // Merge the updated node into the membership list
+        if let Err(e) = self.inner.members.merge(&updated_node) {
+            warn!("Failed to update local node in membership list: {}", e);
+        }
+
+        // Broadcast an Alive message to refute the Confirm
+        let broadcast = Broadcast::Alive {
+            incarnation: new_incarnation,
+            member: local_node.name.clone(),
+        };
+
+        self.broadcast_to_random_nodes(broadcast).await?;
+
+        info!("Refuted death confirmation by broadcasting Alive message with new incarnation {}", new_incarnation);
+        
+        Ok(())
+    }
+
+    async fn broadcast_to_random_nodes(&self, broadcast: Broadcast) -> Result<()> {
+        let local_node = self.get_local_node().await?;
+        let local_addr = local_node.socket_addr()?;
+        
+        let known_nodes = self.inner.members.select_random_nodes(BROADCAST_FANOUT, Some(|n: &Node<M>| {
+            if let Ok(addr) = n.socket_addr() {
+                return !n.is_alive() ||  addr == local_addr
+            }
+            false
+        })).unwrap_or_default();
+
+        for node in &known_nodes {
+            if let Err(e) = self.inner.net_svc.broadcast(node.socket_addr()?, local_addr, broadcast.clone()).await {
+                warn!("Failed to broadcast message to {}: {}", node.name, e);
+            }
+        }
+
+        debug!("Broadcast sent to {} known nodes", known_nodes.len());
+        Ok(())
+    }
+
+    pub(crate) async fn handle_alive_node(&self, incarnation: u64, member: &str) -> Result<()> {
+        match self.inner.members.get_node(member)? {
+            Some(node) => {
+                match self.inner.members.merge(&node) {
+                    Ok(merge_result) => {
+                        match merge_result.action {
+                            MergeAction::Updated => {
+                                info!("Node {} is now alive with incarnation {}", member, incarnation);
+                                
+                                // Only disseminate if the node was previously suspected or dead
+                                if let Some(old_state)= merge_result.old_state {
+                                    if old_state != NodeState::Alive {
+                                        self.disseminate_alive(node).await?;
+                                    }
+                                }
+                            },
+                            MergeAction::Unchanged => {
+                                debug!(
+                                    "Received outdated alive message for node {} (received incarnation: {}, current incarnation: {})", 
+                                    member, 
+                                    incarnation, 
+                                    node.incarnation(),
+                                );
+                            },
+                            _ => {
+                                warn!("Unexpected merge result when marking node {} as alive", member);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to merge node {} into cluster: {}", node.name, e);
+                    }
+                }
+            },
+            None => {
+                warn!("Received alive message for unknown node: {}", member);
+                // Optionally, we could request full state from the sender
+                return Ok(());
+            }
+        };
+
+        Ok(())
+    }
+
+    async fn handle_sync_req(&self, mut stream: TcpStream,message: Message) -> Result<()> {
+        debug!("HANDLE-SYNC-REQ");
+        Ok(())
+    }
+
+    /// Notifies nodes of a peer joining the network
+    pub async fn join(&self, target: SocketAddr) -> Result<()> {
+        debug!("Initiating join process with initial target: {}", target);
+
+        let incarnation = self.next_incarnation();
+        let local_node = self.get_local_node().await?;
+        let local_addr = local_node.socket_addr()?;
+        let broadcast = Broadcast::Join {  
+            member: RemoteNode { 
+                name: local_node.name.clone(),
+                address: local_addr,
+                metadata: local_node.metadata.to_bytes()?, 
+                state: local_node.state().clone(), 
+                incarnation,
+            },
+        };
+
+        self.inner.net_svc.broadcast(target, local_addr, broadcast.clone()).await
+            .context("failed to send join broadcast to initial contact")?;
+
+        // Broadcast join message to a subset of known nodes (if any)
+        let known_nodes = self.inner.members.select_random_nodes(BROADCAST_FANOUT, Some(|n: &Node<M>| {
+            if let Ok(addr) = n.socket_addr() {
+                return !n.is_alive() || addr == target || addr == local_addr
+            }
+            false
+        })).unwrap_or_default();
+
+        for node in &known_nodes {
+            if let Err(e) = self.inner.net_svc.broadcast(node.socket_addr()?, local_addr, broadcast.clone()).await {
+                warn!("failed to broadcast join message to {}: {}", node.name, e);
+            }
+        }
+
+        debug!(
+            "Join broadcast sent to initial contact and {} other nodes", 
+            known_nodes.len(),
+        );
+        debug!(
+            "{}", 
+            pretty_debug("Membership:", &self.inner.members.get_all_nodes()?),
+        );
 
         Ok(())
     }
@@ -757,6 +1031,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                         MergeAction::Unchanged => {
                             debug!("No changes for node {} in the cluster", node.name);
                         },
+                        _ => {}
                     }
                 },
                 Err(e) => {
@@ -789,7 +1064,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                 *state = GossipodState::Stopped;
                 Ok(())
             }
-            GossipodState::Idle => Err(anyhow::anyhow!("Swim is not running")),
+            GossipodState::Idle => Err(anyhow::anyhow!("Gossipod is not running")),
             GossipodState::Stopped => Ok(()),  // Already stopped, no-op
         }
     }
