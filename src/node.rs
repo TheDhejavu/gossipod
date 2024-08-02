@@ -6,38 +6,47 @@ use anyhow::{Context as _, Result};
 use serde::{Serialize, Deserialize};
 use sysinfo::System;
 use std::cmp::Ordering;
-use std::any::{type_name, TypeId};
+use std::any::type_name;
 use crate::state::NodeState;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct NodeStatus {
     incarnation: u64,
     pub state: NodeState,
-    last_updated: SystemTime,
+    last_updated: u64,
 }
 
 impl NodeStatus {
     /// Creates a new `NodeStatus` with default values.
     fn new(incarnation: u64) -> Self {
-        let now = SystemTime::now();
         Self {
             incarnation,
             state: NodeState::Unknown,
-            last_updated: now,
+            last_updated: 0,
         }
     }
 
     /// Updates the state of the Node and records the time of change.
-    pub(crate) fn update_state(&mut self, new_state: NodeState) {
+    pub(crate) fn update_state(&mut self, new_state: NodeState) -> Result<()> {
         self.state = new_state;
-        self.last_updated = SystemTime::now();
+        self.last_updated = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("unable to get time ")?
+            .as_secs();
+
+        Ok(())
     }
 
     /// Increments the incarnation number and updates the last change time.
     /// this should only be used in test.
-    fn increment_incarnation(&mut self) {
+    fn increment_incarnation(&mut self) -> Result<()> {
         self.incarnation += 1;
-        self.last_updated = SystemTime::now();
+        self.last_updated = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("unable to get time ")?
+            .as_secs();
+
+        Ok(())
     }
 }
 
@@ -68,6 +77,7 @@ impl DefaultMetadata {
             .duration_since(UNIX_EPOCH)
             .expect("unable to get startup timestamp")
             .as_secs();
+
 
         Self {
             hostname,
@@ -161,6 +171,17 @@ pub trait NodeMetadata: Send + Sync + 'static + Clone + Debug + Serialize + for<
         let wrapper: Wrapper<Self> = bincode::deserialize(bytes)
             .context("failed to deserialize metadata from bytes")?;
 
+        // This approach introduces an extra byte for type-safety checking to determine the metadata type used by nodes.
+        // While it may seem hacky, it provides a reliable method to ensure consistency across the cluster.
+        //
+        // Alternative: We could check the typename and attempt deserialization into respective types.
+        // However, this method is preferable for several reasons:
+        // 1. It allows for immediate validation and fails fast if inconsistencies are detected.
+        // 2. It enforces a similar metadata format across all nodes, which is generally expected and desired in a cluster.
+        // 3. It avoids potential issues that could arise from nodes using different metadata types.
+        //
+        // At the point of writing this i can't think of any justification for nodes within the same cluster to use different metadata formats.
+        // Enforcing a uniform metadata type across all nodes promotes consistency and simplifies cluster management.
         if wrapper.type_name != Self::type_name(&wrapper.data) {
             anyhow::bail!("Type mismatch: expected {}, found {}", Self::type_name(&wrapper.data), wrapper.type_name);
         }
@@ -194,7 +215,7 @@ impl<M: NodeMetadata> Node<M> {
 
     /// Returns the `SocketAddr` for this Node.
     pub fn with_state(&mut self, new_state: NodeState) -> Self {
-        self.status.update_state(new_state);
+        self.status.state = new_state;
         self.clone()
     }
 
@@ -224,8 +245,8 @@ impl<M: NodeMetadata> Node<M> {
     }
 
     /// Updates the state of the Node.
-    pub(crate) fn update_state(&mut self, new_state: NodeState) {
-        self.status.update_state(new_state);
+    pub(crate) fn update_state(&mut self, new_state: NodeState) -> Result<()> {
+        self.status.update_state(new_state)
     }
 
     /// Advances the Node to the next state.
@@ -240,7 +261,7 @@ impl<M: NodeMetadata> Node<M> {
 
     /// Merges the state of another Node into this Node.
     /// Returns true if any changes were made.
-    pub fn merge(&mut self, other: &Node<M>) -> bool {
+    pub fn merge(&mut self, other: &Node<M>) -> Result<bool> {
         let self_status = &mut self.status;
         let other_status = &other.status;
 
@@ -248,31 +269,40 @@ impl<M: NodeMetadata> Node<M> {
             Ordering::Less => {
                 *self_status = other_status.clone();
                 self.metadata = other.metadata.clone();
-                true
+                Ok(true)
             }
             Ordering::Equal => {
                 if other_status.state.precedence() > self_status.state.precedence() {
-                    self_status.update_state(other_status.state.clone());
+                    self_status.update_state(other_status.state.clone())?;
                     self_status.last_updated = other_status.last_updated;
                     self.metadata = other.metadata.clone();
-                    true
+                    Ok(true)
                 } else if other_status.state == self_status.state && other_status.last_updated > self_status.last_updated {
                     self_status.last_updated = other_status.last_updated;
                     self.metadata = other.metadata.clone();
-                    true
+                    Ok(true)
                 } else {
-                    println!("{}", "true");
-                    false
+                    Ok(false)
                 }
             }
-            Ordering::Greater => false, // No-Op
+            Ordering::Greater => Ok(false), // No-Op
         }
     }
 
     /// Checks if the Node has been in the Suspect state for longer than the given timeout.
-    pub fn suspect_timeout(&self, timeout: Duration) -> bool {
-        self.status.state == NodeState::Suspect && 
-        SystemTime::now().duration_since(self.status.last_updated).unwrap_or_default() > timeout
+    pub fn suspect_timeout(&self, timeout: Duration) -> Result<bool> {
+        if self.status.state != NodeState::Suspect {
+            return Ok(false);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+
+        let time_in_suspect_state = now.saturating_sub(self.status.last_updated);
+        
+        Ok(time_in_suspect_state > timeout.as_secs())
     }
 }
 
@@ -369,26 +399,26 @@ mod tests {
         // Test: Higher incarnation wins
         prev_node.status.increment_incarnation();
         new_node.update_state(NodeState::Suspect);
-        assert!(!prev_node.merge(&new_node));
+        assert!(!prev_node.merge(&new_node).unwrap());
         assert_eq!(prev_node.status.state, NodeState::Alive);
 
         // Test: Equal incarnation, higher precedence state wins
         prev_node.update_state(NodeState::Alive);
         new_node.status.increment_incarnation();
         new_node.update_state(NodeState::Dead);
-        assert!(prev_node.merge(&new_node));
+        assert!(prev_node.merge(&new_node).unwrap());
         assert_eq!(new_node.status.state, NodeState::Dead);
 
         // Test: Equal incarnation and state, more recent change wins
         std::thread::sleep(Duration::from_millis(10));
         new_node.update_state(NodeState::Dead);
-        assert!(prev_node.merge(&new_node));
+        assert!(prev_node.merge(&new_node).unwrap());
         assert!(prev_node.status.last_updated == new_node.status.last_updated);
 
         // Test: Lower incarnation doesn't overwrite (no-op)
         prev_node.status.increment_incarnation();
         prev_node.update_state(NodeState::Alive);
-        assert!(!prev_node.merge(&new_node));
+        assert!(!prev_node.merge(&new_node).unwrap());
         assert_eq!(prev_node.status.state, NodeState::Alive);
     }
 }

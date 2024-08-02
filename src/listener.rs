@@ -1,8 +1,8 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 use anyhow::Result;
 use log::{error, info, warn};
 use tokio::{
-    net::{TcpStream, UdpSocket},
+    net::TcpStream,
     select,
     sync::broadcast,
 };
@@ -54,7 +54,7 @@ impl<M: NodeMetadata> EventListener<M> {
                     }
                 },
                 _ = shutdown_rx.recv() => {
-                    info!("[GOSSIPOD] Closing Event Listeners...");
+                    info!("[RECV] Closing Event Listeners...");
                     break;
                 }
             }

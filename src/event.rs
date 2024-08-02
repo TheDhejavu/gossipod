@@ -153,7 +153,7 @@ impl EventManager {
                     }
                 }
                 _ = shutdown_rx.recv() => {
-                    info!("Timeout task shutting down");
+                    info!("[RECV] Timeout task shutting down");
                 }
             }
         });
@@ -173,7 +173,7 @@ impl EventManager {
                         this.cleanup().await;
                     }
                     _ = shutdown_rx.recv() => {
-                        info!("Cleanup task shutting down");
+                        info!("[RECV] Cleanup task shutting down");
                         break;
                     }
                 }

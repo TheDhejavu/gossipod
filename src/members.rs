@@ -153,7 +153,7 @@ impl<M: NodeMetadata> MembershipList<M> {
         self.write_operation(|nodes| {
             if let Some(existing_node) = nodes.get_mut(&other_node.name) {
                 let old_state = existing_node.state();
-                let changed = existing_node.merge(other_node);
+                let changed = existing_node.merge(other_node)?;
                 let new_state = existing_node.state();
                 
                 Ok(MergeResult {

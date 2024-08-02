@@ -40,33 +40,52 @@ mod event;
 mod notifer;
 mod utils;
 
-//  # SWIM Protocol Implementation for GOSSIPOD:
+//  # SWIM Protocol Implementation for GOSSIPOD
 
-/// This module implements a simple asynchronous SWIM (Scalable Weakly-consistent
-/// Infection-style Membership) protocol. The implementation is divided
-/// into several components to foster modularity, shareability, and clarity:
+/// This module implements an asynchronous SWIM (Scalable Weakly-consistent
+/// Infection-style Membership) protocol. The implementation is modularized
+/// for clarity, maintainability, and potential code reuse:
 ///
-/// IDEA?
-// `PING`` and `PING-REQ` wil be used for failure detections and information
-// dissemination , which means messages have to be piggybacked while we wait or we can 
-// create a future event that will wait for ack message based on sequence number within a time
-// frame. PIN or PING-REQ will happen via constant probing
+/// * Gossipod: Core protocol logic handler that manages messaging requests from 
+/// cluster nodes and executes protocol-specific actions.
+///
+/// * Listeners: Network event processors that handle incoming TCP and UDP connections
+/// and process messages according to the Gossipod protocol.
+///
+/// * MembershipList: Local membership state manager that manages membership 
+/// information changes through a single 'merge' entry point. It compares existing 
+/// data with new data and applies necessary updates.
+///
+/// * Transport: Network communication layer that provides out-of-the-box UDP and TCP 
+/// communication for inter-node interaction. It utilizes Tokio runtime for efficient 
+/// concurrency, continuously listens to streams and socket packets, and forwards data 
+/// to listeners for protocol-specific actions. A future improvement plan is to 
+/// implement `io_uring`` for enhanced performance.
+///
+/// * NetService (NetSvc): Intermediary between Gossipod and Transport that constructs 
+/// messages and forwards them to the transport layer.
+///
+/// Protocol Implementation Details:
+/// `PING`` and `PING-REQ` wil be used for failure detections and information
+/// dissemination , which means messages have to be piggybacked while we wait or we can 
+/// create a future event that will wait for ack message based on sequence number within a time
+/// frame. PIN or PING-REQ will happen via constant probing
 
-// `BROADCAST`` is used to disseminate messages (JOIN, LEAVE, SUSPECT, CONFIRM)
-// node triggers this when it discovers a state change of a node or receives
-// a voluntarity requests from a node that changes it state, E.G when a node shuts down
-// it sends a leave announcement to x random nodes notifying them of is dispature, when 
-// the nodes receives this request they immediately take action by removng the node from 
-// their local membership list and in the long run information is dissiemnated via piggybacking
-// on the failure detection infection style logic during the regular PING or PING_REQ 
+/// `BROADCAST`` is used to disseminate messages (JOIN, LEAVE, SUSPECT, CONFIRM)
+/// node triggers this when it discovers a state change of a node or receives
+/// a voluntarity requests from a node that changes it state, E.G when a node shuts down
+/// it sends a leave announcement to x random nodes notifying them of is dispature, when 
+/// the nodes receives this request they immediately take action by removng the node from 
+/// their local membership list and in the long run information is dissiemnated via piggybacking
+/// on the failure detection infection style logic during the regular PING or PING_REQ 
 
-// In a nutshell gossipod will have 3 types of messages:
-// PING, PING-REQ, ANNOUNCE (JOIN, LEAVE, SUSPECT, ALIVE, CONFIRM) 
-// PING & PING-REQ: handles constant stat exchange via information dissemination piggybacked on failure detection logic
-// BROADCAST: handles random broadcast when a state changes either through volunrary request or through regular failure detection
-// Each node in the network maintains an incarnation number, starting at zero, which can only be incremented by the node itself. 
-// This number is crucial for managing the node's state in other nodes' local membership lists and serves as a means to refute suspicions 
-//`(SWIM+Inf.+Susp.)` from other nodes.
+/// In a nutshell gossipod will have 3 types of messages:
+/// PING, PING-REQ, ANNOUNCE (JOIN, LEAVE, SUSPECT, ALIVE, CONFIRM) 
+/// PING & PING-REQ: handles constant stat exchange via information dissemination piggybacked on failure detection logic
+/// BROADCAST: handles random broadcast when a state changes either through volunrary request or through regular failure detection
+/// Each node in the network maintains an incarnation number, starting at zero, which can only be incremented by the node itself. 
+/// This number is crucial for managing the node's state in other nodes' local membership lists and serves as a means to refute suspicions 
+/// `(SWIM+Inf.+Susp.)` from other nodes.
 
 pub struct Gossipod<M: NodeMetadata = DefaultMetadata> {
     inner: Arc<InnerGossipod<M>>,
@@ -254,7 +273,7 @@ impl<M: NodeMetadata> Gossipod<M> {
             _ = udp_handle => Ok(ShutdownReason::UdpFailure),
             _ = scheduler_handle => Ok(ShutdownReason::SchedulerFailure),
             _ = shutdown_rx.recv() => {
-                info!("[GOSSIPOD] Initiating graceful shutdown..");
+                info!("[RECV] Initiating graceful shutdown..");
                 Ok(ShutdownReason::Termination)
             }
         }
@@ -324,7 +343,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        warn!("Shutdown signal received, stopping TCP listener");
+                        warn!("[RECV] Shutdown signal received, stopping TCP listener");
                         return Ok(());
                     }
                 }
@@ -359,7 +378,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                                 tokio::select! {
                                     _ = time::sleep(delay) => {}
                                     _ = shutdown_rx.recv() => {
-                                        warn!("Shutdown signal received during TCP listener restart delay");
+                                        warn!("[RECV] Shutdown signal received during TCP listener restart delay");
                                         return Ok(());
                                     }
                                 }
@@ -367,7 +386,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        warn!("Shutdown signal received, stopping UDP listener");
+                        warn!("[RECV] Shutdown signal received, stopping UDP listener");
                         return Ok(());
                     }
                 }
@@ -406,7 +425,7 @@ impl<M: NodeMetadata> Gossipod<M> {
 
             // Create a ticker for the gossip interval
             let mut gossip_interval = time::interval(gossipod.inner.config.gossip_interval);
-            info!("starting scheduler.....");
+            debug!("starting scheduler.....");
 
             loop {
                 tokio::select! {
@@ -421,7 +440,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        info!("Scheduler shutting down");
+                        info!("[RECV] Scheduler shutting down");
                         break;
                     }
                 }
@@ -545,7 +564,7 @@ impl<M: NodeMetadata> Gossipod<M> {
         let port = self.inner.config.port();
         let incarnation = self.next_incarnation();
         let mut node = Node::new(ip_addr, port, name.clone(), incarnation, self.inner.metadata.clone());
-        node.update_state(NodeState::Alive);
+        node.update_state(NodeState::Alive)?;
 
         match self.inner.members.merge(&node) {
             Ok(merge_result) => {

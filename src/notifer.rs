@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, RwLock};
 
-
 pub(crate) struct NotifierInner {
     channel_tx: mpsc::Sender<Vec<u8>>,
 }
