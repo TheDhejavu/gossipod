@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use anyhow::{Result, Context, anyhow};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use crate::config::{DEFAULT_CHANNEL_BUFFER_SIZE, DEFAULT_MESSAGE_BUFFER_SIZE, MAX_MESSAGE_SIZE};
+use crate::config::{DEFAULT_CHANNEL_BUFFER_SIZE, DEFAULT_MESSAGE_BUFFER_SIZE, MAX_UDP_PACKET_SIZE};
 use crate::message::Message;
 
 type NetworkTcpStream = (SocketAddr, TcpStream);
@@ -63,9 +63,9 @@ impl NodeTransport for Transport {
 
     /// Sends a UDP message to the specified address
     async fn write_to_udp(&self, addr: SocketAddr, message: &[u8]) -> Result<()> {
-        // if message.len() > MAX_MESSAGE_SIZE {
-        //     return Err(anyhow!("Message too large for UDP packet"));
-        // }
+        if message.len() > MAX_UDP_PACKET_SIZE {
+            return Err(anyhow!("Message too large for UDP packet, allowed {}bytes but got {}bytes", MAX_UDP_PACKET_SIZE, message.len()));
+        }
 
         let udp_socket = self.udp_socket.read().await;
         let socket = udp_socket.as_ref().ok_or_else(|| anyhow!("UDP socket not initialized"))?;

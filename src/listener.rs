@@ -116,7 +116,7 @@ impl<M: NodeMetadata> EventListener<M> {
     /// Processes a received UDP message based on its type.
     async fn process_udp_packet(gossipod: Gossipod<M>, message: Message, addr: SocketAddr) -> Result<()> {
         match message.msg_type {
-            MessageType::Ping => gossipod.handle_ping(message).await,
+            MessageType::Ping => gossipod.handle_ping(message.sender,message.payload).await,
             MessageType::PingReq => gossipod.handle_ping_req(message).await,
             MessageType::Ack => gossipod.handle_ack(message).await,
             MessageType::NoAck => gossipod.handle_no_ack(message).await,

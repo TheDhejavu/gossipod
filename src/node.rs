@@ -10,6 +10,24 @@ use std::cmp::Ordering;
 use std::any::type_name;
 use crate::state::NodeState;
 
+#[derive(Eq, PartialEq)]
+pub(crate) struct NodePriority<M: NodeMetadata> {
+    pub(crate) last_probed: SystemTime,
+    pub(crate) node: Node<M>,
+}
+
+impl<M: NodeMetadata> Ord for NodePriority<M> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.last_probed.cmp(&self.last_probed)
+    }
+}
+
+impl<M: NodeMetadata> PartialOrd for NodePriority<M> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct NodeStatus {
     incarnation: u64,

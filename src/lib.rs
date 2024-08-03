@@ -1,18 +1,23 @@
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
-use config::BROADCAST_FANOUT;
+use codec::MessageCodec;
+use config::{BROADCAST_FANOUT, MAX_UDP_PACKET_SIZE, METADATA_OVERHEAD};
 use log::*;
 use members::MergeAction;
-use message::{Broadcast, MessagePayload};
+use message::{Broadcast, MessagePayload, MessageType, PingPayload};
+use node::NodePriority;
 pub use node::{DefaultMetadata, NodeMetadata};
 use notifer::Notifier;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
+use tokio_util::bytes::{BufMut, BytesMut};
+use tokio_util::codec::Encoder as _;
 use utils::pretty_debug;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::{
     config::{GossipodConfig, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT, MAX_CONSECUTIVE_FAILURES},
     event::EventManager,
@@ -138,6 +143,7 @@ pub(crate) struct InnerGossipod<M: NodeMetadata>  {
     /// Counter for synchronization requests
     sync_req: AtomicU64,
     notifier: Arc<Notifier>,
+    last_probed_times: RwLock<HashMap<String, SystemTime>>,
 
     /// Network service for handling communication
     pub(crate) net_svc: NetSvc,
@@ -189,6 +195,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                 incarnation: AtomicU64::new(0),
                 sync_req: AtomicU64::new(0),
                 notifier: Arc::new(Notifier::new()),
+                last_probed_times: RwLock::new(HashMap::new()),
                 event_manager: EventManager::new(Duration::from_millis(500)),
             })
         };
@@ -455,7 +462,7 @@ impl<M: NodeMetadata> Gossipod<M> {
     /// Generate the next sequence number for message ordering.
     /// This method allows wrapping around to 0 when the maximum is reached.
     fn next_sequence_number(&self) -> u64 {
-        self.inner.sequence_number.fetch_add(1, Ordering::SeqCst)
+        self.inner.sequence_number.fetch_add(1, Ordering::SeqCst) + 1
     }
 
    /// Generate the next incarnation number for conflict resolution.
@@ -486,9 +493,116 @@ impl<M: NodeMetadata> Gossipod<M> {
 
     /// Gossipod PROBE - Probes randomly selected nodes
     pub(crate) async fn probe(&self) -> Result<()> {
-        // info!("PROBING");
-        // unimplemented!()
+        debug!("START PROBING");
+        let this = self.clone();
+
+        let local_node = self.get_local_node().await?;
+        let local_addr = local_node.socket_addr()?;
+
+        let target_node = this.inner.members.next_node(Some(|n: &Node<M>| {
+            if let Ok(addr) = n.socket_addr() {
+                return !n.is_alive() || addr == local_addr
+            }
+            false
+        }))?;
+
+        if let Some(node) = target_node {
+            debug!("picked a random node of name: {}", node.name);
+
+            let ping_payload = PingPayload {
+                sequence_number: self.next_sequence_number(),
+                // set update as empty at first because we want to make sure
+                //  that new updates does not exit minimum packet size
+                piggybacked_updates: vec![], 
+            };
+
+            let ping = Message {
+                msg_type: MessageType::Ping,
+                sender: local_addr,
+                payload: MessagePayload::Ping(ping_payload),
+            };
+            println!("PING: {:?}", ping);
+            let message_bytes = self.message_with_prioritized_updates(ping).await?;
+    
+            self.inner.net_svc.transport.write_to_udp(node.socket_addr()?,&message_bytes).await?;
+        } else {
+            debug!("No target to select")
+        }
         Ok(())
+    }
+
+    async fn message_with_prioritized_updates(&self, item: Message) -> Result<BytesMut> {
+        let mut priority_queue = BinaryHeap::new();
+        let all_nodes = self.inner.members.get_all_nodes()?;
+
+        let local_node = self.get_local_node().await?;
+        let mut message_bytes = BytesMut::new();
+
+        
+        MessageCodec::encode_u8(item.msg_type as u8, &mut message_bytes)?;
+        MessageCodec::encode_socket_addr(&local_node.socket_addr()?, &mut message_bytes)?;
+
+        let mut payload_bytes = BytesMut::new();
+        MessageCodec::encode_message_payload(&item.payload, &mut payload_bytes)?;
+
+        // Reserve space for number of piggybacked updates
+        let updates_count_index = payload_bytes.len();
+        payload_bytes.put_u32(0);
+
+        for node in &all_nodes {
+            let last_probed = self.get_last_probed_time(&node.name).await.unwrap_or(UNIX_EPOCH);
+            priority_queue.push(NodePriority {
+                last_probed,
+                node: node.clone(),
+            });
+        }
+
+        let mut updates_count = 0;
+
+        while let Some(node_priority) = priority_queue.pop() {
+            let remote_node = RemoteNode {
+                name: node_priority.node.name.clone(),
+                address: node_priority.node.socket_addr()?,
+                metadata: node_priority.node.metadata.to_bytes()?,
+                state: node_priority.node.state().clone(),
+                incarnation: node_priority.node.incarnation(),
+            };
+            self.update_last_probed_time(&node_priority.node.name).await?;
+            
+            let mut temp_bytes = BytesMut::new();
+            MessageCodec::encode_remote_node(&remote_node, &mut temp_bytes)?;
+
+            if message_bytes.len() + payload_bytes.len() + temp_bytes.len() + 4 <= MAX_UDP_PACKET_SIZE {
+                payload_bytes.extend_from_slice(&temp_bytes);
+                updates_count += 1;
+            } else if updates_count == 0 && message_bytes.len() + payload_bytes.len() < MAX_UDP_PACKET_SIZE {
+                // If no updates yet and this one doesn't fit, add it anyway if there's any space
+                payload_bytes.extend_from_slice(&temp_bytes);
+                updates_count += 1;
+                break;
+            } else {
+                // This update doesn't fit, and we already have some updates anyway, so we're done
+                break;
+            }
+        }
+
+        // Update the number of piggybacked updates
+        payload_bytes[updates_count_index..updates_count_index + 4].copy_from_slice(&(updates_count as u32).to_be_bytes());
+
+        // Add payload length and payload to message_bytes
+        MessageCodec::encode_bytes(&payload_bytes, &mut message_bytes)?;
+
+        Ok(message_bytes)
+    }
+
+    async fn update_last_probed_time(&self, node_name: &str) -> Result<()> {
+        let mut probe_times = self.inner.last_probed_times.write().await;
+        probe_times.insert(node_name.to_string(), SystemTime::now());
+        Ok(())
+    }
+
+    async fn get_last_probed_time(&self, node_name: &str) -> Option<SystemTime> {
+        self.inner.last_probed_times.read().await.get(node_name).cloned()
     }
 
     /// Gossipod GOSSIP - Gossip with randomly selected nodes for state changes
@@ -499,7 +613,6 @@ impl<M: NodeMetadata> Gossipod<M> {
 
     /// Gossipod LEAVE - Notifies nodes of a peer leaving 
     pub async fn leave(&self) -> Result<()> {
-        debug!("LEAVING");
         let incarnation = self.next_incarnation();
         let local_node = self.get_local_node().await?;
         let local_addr = local_node.socket_addr()?;
@@ -507,6 +620,8 @@ impl<M: NodeMetadata> Gossipod<M> {
             member: local_node.name,
             incarnation,
         };
+
+        println!("LEave broadcast: {:?}", broadcast);
 
         // Broadcast leave message to a subset of known nodes (if any)
         let known_nodes = self.inner.members.select_random_nodes(BROADCAST_FANOUT, Some(|n: &Node<M>| {
@@ -527,8 +642,17 @@ impl<M: NodeMetadata> Gossipod<M> {
 
     }
 
-    async fn handle_ping(&self, message: Message) -> Result<()> {
-        unimplemented!()
+    async fn handle_ping(&self, sender: SocketAddr,message_payload: MessagePayload) -> Result<()> {
+        println!("NEW PING {:?}", message_payload);
+        match message_payload {
+            MessagePayload::Ping(payload) => {
+                if payload.piggybacked_updates.len() > 0 {
+                    self.handle_piggybacked_updates(payload.piggybacked_updates).await?;
+                }
+            },
+            _ => {}
+        }
+       Ok(())
     }
 
     async fn handle_no_ack(&self, message: Message) -> Result<()> {
@@ -583,7 +707,7 @@ impl<M: NodeMetadata> Gossipod<M> {
     }
 
     pub(crate) async fn handle_suspect_node(&self, incarnation: u64, member: &str) -> Result<()> {
-        let mut node = match self.inner.members.get_node(member)? {
+        let node = match self.inner.members.get_node(member)? {
             Some(n) => n,
             None => {
                 warn!("Received suspect message for unknown node: {}", member);
@@ -784,8 +908,14 @@ impl<M: NodeMetadata> Gossipod<M> {
     }
 
     async fn handle_leave_node(&self, incarnation: u64, member: &str) -> Result<()> {
+        println!("Leave incarnation: {}", incarnation);
+
         if let Ok(Some(node)) = self.inner.members.get_node(member) {
-            match self.inner.members.merge(&node) {
+            let mut dup_node = node.clone();
+            dup_node.update_state(NodeState::Leaving)?;
+            dup_node.set_incarnation(incarnation);
+
+            match self.inner.members.merge(&dup_node) {
                 Ok(merge_result) => {
                     match merge_result.action {
                         MergeAction::Removed => {
@@ -825,12 +955,12 @@ impl<M: NodeMetadata> Gossipod<M> {
             return self.refute_node().await;
         }
 
-        if let Ok(Some(mut node)) = self.inner.members.get_node(member) {
-            // Update the node state to Dead
-            node.update_state(NodeState::Dead)?;
-            node.set_incarnation(incarnation);
+        if let Ok(Some(node)) = self.inner.members.get_node(member) {
+            let mut dup_node = node.clone();
+            dup_node.update_state(NodeState::Dead)?;
+            dup_node.set_incarnation(incarnation);
 
-            match self.inner.members.merge(&node) {
+            match self.inner.members.merge(&dup_node) {
                 Ok(merge_result) => {
                     match merge_result.action {
                         MergeAction::Updated => {
@@ -909,7 +1039,11 @@ impl<M: NodeMetadata> Gossipod<M> {
     pub(crate) async fn handle_alive_node(&self, incarnation: u64, member: &str) -> Result<()> {
         match self.inner.members.get_node(member)? {
             Some(node) => {
-                match self.inner.members.merge(&node) {
+                let mut dup_node = node.clone();
+                dup_node.update_state(NodeState::Dead)?;
+                dup_node.set_incarnation(incarnation);
+
+                match self.inner.members.merge(&dup_node) {
                     Ok(merge_result) => {
                         match merge_result.action {
                             MergeAction::Updated => {
@@ -1001,21 +1135,22 @@ impl<M: NodeMetadata> Gossipod<M> {
         Ok(())
     }
 
-    pub async fn handle_piggybacked_updates(&self, updates: Vec<RemoteNode> ) -> Result<()> {
-        debug!("new piggyback");
+    async fn handle_piggybacked_updates(&self, updates: Vec<RemoteNode> ) -> Result<()> {
+        debug!("New piggybacked updates ");
 
         let converted_nodes: Result<Vec<Node<M>>> = updates.into_iter()
             .map(|payload| {
                 let metadata = M::from_bytes(&payload.metadata)
                     .context("failed to deserialize node metadata")?;
-                
-                Ok(Node::new(
+                let mut node = Node::new(
                     payload.address.ip(),
                     payload.address.port(),
                     payload.name,
                     payload.incarnation,
                     metadata
-                ))
+                );
+                node.update_state(payload.state)?;
+                Ok(node)
             })
             .collect();
 
@@ -1040,6 +1175,7 @@ impl<M: NodeMetadata> Gossipod<M> {
             }
         }
 
+        debug!("{}", pretty_debug("Membership:", &self.inner.members.get_all_nodes()?));
         Ok(())
     }
 

@@ -1,14 +1,15 @@
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeState {
-    Alive,
-    Suspect,
-    Dead,
-    Leaving,
-    Left,
-    Unknown,
+    Dead = 5,
+    Left = 4,
+    Leaving = 3,
+    Suspect = 2,
+    Alive = 1,
+    Unknown = 0,
 }
 
 impl NodeState {
@@ -42,6 +43,18 @@ impl NodeState {
         }
     }
 
+    pub(crate) fn from_u8(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(NodeState::Unknown),
+            1 => Ok(NodeState::Alive),
+            2 => Ok(NodeState::Suspect),
+            3 => Ok(NodeState::Leaving),
+            4 => Ok(NodeState::Left),
+            5 => Ok(NodeState::Dead),
+            _ => Err(anyhow!("Invalid NodeState value: {}", value)),
+        }
+    }
+
     pub(crate) fn precedence(&self) -> u8 {
         match self {
             NodeState::Dead => 5,
@@ -59,6 +72,7 @@ impl Default for NodeState {
         NodeState::Unknown
     }
 }
+
 
 impl fmt::Display for NodeState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

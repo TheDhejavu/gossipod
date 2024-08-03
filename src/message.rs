@@ -4,7 +4,6 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_util::{bytes::BytesMut, codec::{Decoder, Encoder}};
-use uuid::Uuid;
 use core::fmt;
 use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
 
@@ -128,11 +127,9 @@ impl MessagePayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Message {
-    pub(crate) id: Uuid,
     pub(crate) msg_type: MessageType,
     pub(crate) payload: MessagePayload,
     pub(crate) sender: SocketAddr,
-    pub(crate) timestamp: u64,
 }
 
 impl Message {
@@ -186,7 +183,7 @@ impl fmt::Display for MessageType {
 }
 
 pub(crate) struct NetSvc {
-    transport: Box<dyn NodeTransport>,
+    pub(crate) transport: Box<dyn NodeTransport>,
 }
 
 impl NetSvc {
@@ -232,11 +229,9 @@ impl NetSvc {
         };
 
         let message = Message {
-            id: Uuid::new_v4(),
             msg_type: MessageType::SyncReq,
             payload: MessagePayload::SyncReq(sync_payload),
             sender,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         };
         
         let mut codec = MessageCodec::new();
@@ -248,11 +243,9 @@ impl NetSvc {
 
     pub async fn broadcast(&self,  target: SocketAddr, sender: SocketAddr, broadcast: Broadcast) -> Result<()> {
         let message = Message {
-            id: Uuid::new_v4(),
             msg_type: MessageType::Broadcast,
             payload: MessagePayload::Broadcast(broadcast.clone()),
             sender,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         };
 
         info!("Sending broadcast: {}", broadcast.type_str());

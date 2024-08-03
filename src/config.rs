@@ -11,16 +11,17 @@ pub(crate) const DEFAULT_PORT: u16 = 5870;
 pub(crate) const DEFAULT_PING_TIMEOUT: u64 = 10_000; 
 pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 10_000;
 pub(crate) const DEFAULT_GOSSIP_INTERVAL: u64 = 5_000; 
-pub(crate) const DEFAULT_PROBING_INTERVAL: u64 = 6_000; 
+pub(crate) const DEFAULT_PROBING_INTERVAL: u64 = 10_000; 
 pub(crate) const DEFAULT_SUSPECT_TIMEOUT: u64 = 10_000; 
 pub(crate) const DEFAULT_MESSAGE_BUFFER_SIZE: usize = 1_024; 
 pub(crate) const DEFAULT_TRANSPORT_TIMEOUT: u64 = 5_000;
 pub(crate) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 100;
 pub(crate) const MAX_RETRY_DELAY: u64 = 60; // in secs
 pub(crate) const MAX_CONSECUTIVE_FAILURES: u32 = 2;
-pub(crate) const MAX_MESSAGE_SIZE: usize = 135; 
-pub(crate) const MAX_UDP_PACKET_SIZE: usize = 65507; // Maximum size for a single UDP packet
+pub(crate) const MAX_UDP_PACKET_SIZE: usize = 1400; 
 pub(crate) const BROADCAST_FANOUT: usize = 2; 
+pub(crate) const METADATA_OVERHEAD: usize = 50;  
+
 
 #[derive(Debug, Clone)]
 pub struct GossipodConfig {
