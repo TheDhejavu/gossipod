@@ -3,18 +3,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
 use codec::MessageCodec;
-use config::{BROADCAST_FANOUT, MAX_UDP_PACKET_SIZE, METADATA_OVERHEAD};
+use config::{BROADCAST_FANOUT, MAX_UDP_PACKET_SIZE};
+use event::{EventState, EventType};
 use log::*;
 use members::MergeAction;
-use message::{Broadcast, MessagePayload, MessageType, PingPayload};
+use message::{AckPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
 use node::NodePriority;
 pub use node::{DefaultMetadata, NodeMetadata};
 use notifer::Notifier;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio::time;
+use tokio::time::{self, Instant};
 use tokio_util::bytes::{BufMut, BytesMut};
-use tokio_util::codec::Encoder as _;
 use utils::pretty_debug;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -196,7 +196,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                 sync_req: AtomicU64::new(0),
                 notifier: Arc::new(Notifier::new()),
                 last_probed_times: RwLock::new(HashMap::new()),
-                event_manager: EventManager::new(Duration::from_millis(500)),
+                event_manager: EventManager::new(),
             })
         };
 
@@ -228,7 +228,7 @@ impl<M: NodeMetadata> Gossipod<M> {
     // |                                                                                |                       
     // +--------------------------------------------------------------------------------+
     pub async fn start(&self) -> Result<()> {
-        info!("[GOSSIPOD] Server Started with `{}`", self.inner.config.name);
+        info!("> [GOSSIPOD] Server Started with `{}`", self.inner.config.name);
         let shutdown_rx = self.inner.shutdown.subscribe();
 
         self.inner.transport.bind_tcp_listener().await?;
@@ -250,6 +250,8 @@ impl<M: NodeMetadata> Gossipod<M> {
         );
         let scheduler_handle = self.spawn_scheduler(self.inner.shutdown.subscribe());
 
+        _ = self.spawn_event_scheduler(self.inner.shutdown.subscribe()).await?;
+    
         let shutdown_reason = self.handle_shutdown_signal(
             tcp_handle, 
             udp_handle, 
@@ -261,16 +263,17 @@ impl<M: NodeMetadata> Gossipod<M> {
             self.inner.shutdown.send(()).
                 map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
-    
-        self.set_state(GossipodState::Stopped).await?;
-        self.inner.event_manager.shutdown().await?;
-        self.leave().await?;
 
-        info!("[GOSSIPOD] Gracefully shut down due to {:?}", shutdown_reason);
+       
+        self.set_state(GossipodState::Stopped).await?;
+        // self.leave().await?;
+
+        info!("> [GOSSIPOD] Gracefully shut down due to {:?}", shutdown_reason);
     
         Ok(())
     }
 
+    // handle shutdown signal
     async fn handle_shutdown_signal(
         &self,
         tcp_handle: tokio::task::JoinHandle<Result<()>>,
@@ -283,7 +286,7 @@ impl<M: NodeMetadata> Gossipod<M> {
             _ = udp_handle => Ok(ShutdownReason::UdpFailure),
             _ = scheduler_handle => Ok(ShutdownReason::SchedulerFailure),
             _ = shutdown_rx.recv() => {
-                info!("[RECV] Initiating graceful shutdown..");
+                info!("> [RECV] Initiating graceful shutdown..");
                 Ok(ShutdownReason::Termination)
             }
         }
@@ -295,7 +298,7 @@ impl<M: NodeMetadata> Gossipod<M> {
         for ip_addr in &self.inner.config.ip_addrs {
             if ip_addr.to_string() == DEFAULT_IP_ADDR || ip_addr.to_string() == "0.0.0.0" {
                 info!(
-                    " [GOSSIPOD] Binding to all network interfaces: {}:{} (Private IP: {}:{})",
+                    "> [GOSSIPOD] Binding to all network interfaces: {}:{} (Private IP: {}:{})",
                     ip_addr.to_string(),
                     self.inner.config.port,
                     private_ip_addr.to_string(),
@@ -303,7 +306,7 @@ impl<M: NodeMetadata> Gossipod<M> {
                 );
             } else {
                 info!(
-                    "[GOSSIPOD] Binding to specific IP: {}:{}",
+                    "> [GOSSIPOD] Binding to specific IP: {}:{}",
                     ip_addr.to_string(),
                     self.inner.config.port
                 );
@@ -435,7 +438,7 @@ impl<M: NodeMetadata> Gossipod<M> {
 
             // Create a ticker for the gossip interval
             let mut gossip_interval = time::interval(gossipod.inner.config.gossip_interval);
-            debug!("starting scheduler.....");
+            debug!("> starting scheduler.....");
 
             loop {
                 tokio::select! {
@@ -449,6 +452,49 @@ impl<M: NodeMetadata> Gossipod<M> {
                             error!("Error during gossiping: {}", e);
                         }
                     }
+                    _ = shutdown_rx.recv() => {
+                        info!("[RECV] Scheduler shutting down");
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn spawn_event_scheduler(&self, mut shutdown_rx: broadcast::Receiver<()>) -> tokio::task::JoinHandle<Result<()>> {
+        let gossipod: Gossipod<M> = self.clone();
+        
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = async {
+                        let duration = gossipod.inner.event_manager.time_to_next_event().await
+                            .unwrap_or(gossipod.inner.config.suspect_timeout);
+
+                        tokio::time::sleep(duration).await;
+                        
+                        let events = gossipod.inner.event_manager.next_events().await;
+                        for (event_type, event) in events {
+                            if event.state == EventState::Completed {
+                                match event_type {
+                                    EventType::Ack { sequence_number } => {
+                                        warn!("Ack with sequence number {} TIMED-OUT", sequence_number);
+                                        let _ = event.sender.try_send(event.state);
+                                    },
+                                    EventType::SuspectTimeout { node } => {
+                                        warn!("Moving node {} to DEAD state", node);
+                                        if let Ok(Some(node)) = gossipod.inner.members.get_node(&node) {
+                                            if node.is_suspect() {
+                                                _ = gossipod.confirm_node_dead(&node).await;
+                                                warn!("Successfully Moved node {} to DEAD state", node.name);
+                                            }
+                                        };
+                                    },
+                                }
+                            }
+                        }
+                    } => {}
                     _ = shutdown_rx.recv() => {
                         info!("[RECV] Scheduler shutting down");
                         break;
@@ -492,42 +538,148 @@ impl<M: NodeMetadata> Gossipod<M> {
     }
 
     /// Gossipod PROBE - Probes randomly selected nodes
+    ///
+    /// This function implements the probing mechanism of the gossip protocol:
+    /// 1. Selects a random node to probe, excluding the local node and dead nodes.
+    /// 2. Sends a Ping message to the selected node.
+    /// 3. Waits for an ACK response or a timeout.
+    /// 4. Handles the response: updates node state or marks the node as suspect if no response.
+    ///
+    /// The function uses a combination of direct UDP messaging and an event-based
+    /// system to handle asynchronous responses. If the direct UDP message fails,
+    /// it falls back to indirect pinging through other nodes.
     pub(crate) async fn probe(&self) -> Result<()> {
-        debug!("START PROBING");
+        debug!("> start probing");
         let this = self.clone();
 
+        // Get local node information
         let local_node = self.get_local_node().await?;
         let local_addr = local_node.socket_addr()?;
 
+        // Select a random node to probe, excluding self and dead nodes
         let target_node = this.inner.members.next_node(Some(|n: &Node<M>| {
-            if let Ok(addr) = n.socket_addr() {
-                return !n.is_alive() || addr == local_addr
-            }
-            false
+            n.socket_addr().map(|addr| !n.is_alive() || addr == local_addr).unwrap_or(false)
         }))?;
 
         if let Some(node) = target_node {
-            debug!("picked a random node of name: {}", node.name);
-
+            debug!("> picked a random node of name: {}", node.name);
+            
+            // Prepare the Ping message
+            let sequence_number = self.next_sequence_number();
             let ping_payload = PingPayload {
-                sequence_number: self.next_sequence_number(),
-                // set update as empty at first because we want to make sure
-                //  that new updates does not exit minimum packet size
+                sequence_number,
                 piggybacked_updates: vec![], 
             };
-
             let ping = Message {
                 msg_type: MessageType::Ping,
                 sender: local_addr,
                 payload: MessagePayload::Ping(ping_payload),
             };
-            println!("PING: {:?}", ping);
+            debug!("> send ping: {:?}", ping);
+
+            // Add prioritized updates to the message
             let message_bytes = self.message_with_prioritized_updates(ping).await?;
-    
-            self.inner.net_svc.transport.write_to_udp(node.socket_addr()?,&message_bytes).await?;
+            let target = node.socket_addr()?;
+
+            // Set up the probing deadline and create an event for ACK tracking
+            let now = Instant::now();
+            let deadline = now + self.inner.config.probing_interval;
+            let mut rx = self.inner.event_manager.schedule_event(
+                EventType::Ack{ sequence_number }, 
+                deadline,
+            ).await?;
+
+            // Send the UDP message, fall back to indirect pinging if it fails
+            if let Err(e) = self.inner.net_svc.transport.write_to_udp(target, &message_bytes).await {
+                error!("[ERR] Failed to send UDP probe message: {}", e);
+                self.send_indirect_pings(local_addr, sequence_number, target).await?;
+            }
+            
+            // here, we only care if we are able to receive an ACK request that triggered
+            // a state change for the event or timeout
+            tokio::select! {
+                event_state = rx.recv() => {
+                    match event_state {
+                        Some(EventState::Intercepted) => {
+                            debug!("> Received ACK for probe to node {}", node.name);
+                        },
+                        Some(EventState::Completed) => {
+                            warn!("> Probe to node {} exceeded deadline", node.name);
+                            self.handle_suspect_node(node).await?;
+                        },
+                        Some(other_state) => {
+                            warn!("> Unexpected event state: {:?}", other_state);
+                        },
+                        None => {
+                            warn!("> Event channel closed unexpectedly for node {}", node.name);
+                        }
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    warn!("Probing deadline reached for node {}", node.name);
+                    self.handle_suspect_node(node).await?;
+                }
+            }
         } else {
-            debug!("No target to select")
+            debug!("No target node to select for probing");
         }
+        Ok(())
+    }
+    async fn handle_suspect_node(&self, node: Node<M>) -> Result<()> {
+        self.suspect_node(node.incarnation(), &node.name).await?;
+        
+        let now = Instant::now();
+        let deadline = now + self.inner.config.suspect_timeout;
+    
+        self.inner.event_manager.schedule_event(
+            EventType::SuspectTimeout { node: node.name }, 
+            deadline,
+        ).await?;
+    
+        Ok(())
+    }
+
+    async fn send_indirect_pings(&self, local_addr: SocketAddr,sequence_number: u64, target: SocketAddr) -> Result<()> {
+        let known_nodes = self.inner.members.select_random_nodes(BROADCAST_FANOUT, Some(|n: &Node<M>| {
+            if let Ok(addr) = n.socket_addr() {
+                return n.is_alive() && addr != local_addr && addr != target
+            }
+            false
+        })).unwrap_or_default();
+    
+        if known_nodes.is_empty() {
+            debug!("> no nodes available for indirect pings");
+            return Ok(());
+        }
+    
+        let ping_req_payload = PingReqPayload {
+            sequence_number,
+            target,
+            // We'll add updates later if packet size is within mimium packet size
+            piggybacked_updates: vec![],
+        };
+    
+        let ping_req = Message {
+            msg_type: MessageType::PingReq,
+            sender: local_addr,
+            payload: MessagePayload::PingReq(ping_req_payload),
+        };
+        
+        for node in &known_nodes {
+            let message_bytes = self.message_with_prioritized_updates(ping_req.clone()).await?;
+    
+            if let Err(e) = self.inner.net_svc.transport.write_to_udp(node.socket_addr()?, &message_bytes).await {
+                warn!("Failed to send indirect ping to {} for target {}: {}", node.name, target, e);
+            } else {
+                debug!("Sent indirect ping to {} for target {}", node.name, target);
+            }
+        }
+    
+        debug!(
+            "Sent indirect pings to {} nodes for target {}",
+            known_nodes.len(), 
+            target,
+        );
         Ok(())
     }
 
@@ -538,7 +690,6 @@ impl<M: NodeMetadata> Gossipod<M> {
         let local_node = self.get_local_node().await?;
         let mut message_bytes = BytesMut::new();
 
-        
         MessageCodec::encode_u8(item.msg_type as u8, &mut message_bytes)?;
         MessageCodec::encode_socket_addr(&local_node.socket_addr()?, &mut message_bytes)?;
 
@@ -607,7 +758,6 @@ impl<M: NodeMetadata> Gossipod<M> {
 
     /// Gossipod GOSSIP - Gossip with randomly selected nodes for state changes
     pub(crate) async fn gossip(&self) -> Result<()> {
-        // info!("GOSSIP");
         Ok(())
     }
 
@@ -621,7 +771,7 @@ impl<M: NodeMetadata> Gossipod<M> {
             incarnation,
         };
 
-        println!("LEave broadcast: {:?}", broadcast);
+        debug!("Leave broadcast: {:?}", broadcast);
 
         // Broadcast leave message to a subset of known nodes (if any)
         let known_nodes = self.inner.members.select_random_nodes(BROADCAST_FANOUT, Some(|n: &Node<M>| {
@@ -642,10 +792,139 @@ impl<M: NodeMetadata> Gossipod<M> {
 
     }
 
-    async fn handle_ping(&self, sender: SocketAddr,message_payload: MessagePayload) -> Result<()> {
-        println!("NEW PING {:?}", message_payload);
+    /// Handles incoming ACK (Acknowledgement).
+    ///
+    /// This function is responsible for processing ACK messages, which are crucial for:
+    /// confirming successful communication with other nodes, updating the event manager about received ACKs,
+    /// and for processing any piggybacked updates that come with the ACK.
+    ///
+    async fn handle_ping(&self, sender: SocketAddr, message_payload: MessagePayload) -> Result<()> {
         match message_payload {
             MessagePayload::Ping(payload) => {
+                debug!("Received PING from {}", sender);
+                self.send_ack(sender, payload.sequence_number).await?;
+    
+                // Handle piggybacked updates
+                if !payload.piggybacked_updates.is_empty() {
+                    self.handle_piggybacked_updates(payload.piggybacked_updates).await?;
+                }
+            },
+            _ => {
+                warn!("Received non-Ping message in handle_ping from {}", sender);
+                return Err(anyhow!("Unexpected message type in handle_ping"));
+            }
+        }
+        Ok(())
+    }
+    async fn send_ack(&self, target: SocketAddr,  sequence_number: u64) -> Result<()> {
+        // Send ACK response
+        let ack_payload = AckPayload {
+            sequence_number,
+            piggybacked_updates: vec![], // We'll add updates later if space permits
+        };
+
+        let local_node = self.get_local_node().await?;
+        let local_addr = local_node.socket_addr()?;
+    
+        let ack = Message {
+            msg_type: MessageType::Ack,
+            sender: local_addr,
+            payload: MessagePayload::Ack(ack_payload),
+        };
+        let message_bytes = self.message_with_prioritized_updates(ack.clone()).await?;
+    
+        if let Err(e) = self.inner.net_svc.transport.write_to_udp(target, &message_bytes).await {
+            warn!("Failed to send ack to {}: {}", target, e);
+        } else {
+            debug!("Sent ACK response to {}", target);
+        }
+        Ok(())
+    }
+    async fn handle_ping_req(&self, sender: SocketAddr, message_payload: MessagePayload) -> Result<()> {
+        match message_payload {
+            MessagePayload::PingReq(payload) => {
+
+                let this = self.clone();
+                tokio::spawn( async move {
+                    // do-update in the background
+                    if payload.piggybacked_updates.len() > 0 {
+                        _ = this.handle_piggybacked_updates(payload.piggybacked_updates).await;
+                    }
+                });
+
+                let local_node = self.get_local_node().await?;
+                let local_addr = local_node.socket_addr()?;
+                
+                // Prepare the Ping message
+                let sequence_number = self.next_sequence_number();
+                let ping_payload = PingPayload {
+                    sequence_number,
+                    piggybacked_updates: vec![], 
+                };
+                let ping = Message {
+                    msg_type: MessageType::Ping,
+                    sender: local_addr,
+                    payload: MessagePayload::Ping(ping_payload),
+                };
+                debug!("> send ping: {:?}", ping);
+
+                // Add prioritized updates to the message
+                let message_bytes = self.message_with_prioritized_updates(ping).await?;
+                let original_target = payload.target;
+                let original_sequence_number = payload.sequence_number;
+
+                // Set up the probing deadline and create an event for ACK tracking
+                let now = Instant::now();
+                let deadline = now + self.inner.config.probing_interval;
+                let mut rx = self.inner.event_manager.schedule_event(EventType::Ack{ sequence_number  }, deadline).await?;
+
+                // Send the UDP PING-REQ message.
+                if let Err(e) = self.inner.net_svc.transport.write_to_udp(original_target, &message_bytes).await {
+                    error!("[ERR] Failed to send UDP PING-REQ: {}", e);
+                    return Ok(());
+                }
+                
+                tokio::select! {
+                    event_state = rx.recv() => {
+                        match event_state {
+                            Some(EventState::Intercepted) => {
+                                debug!(
+                                    "> Received ACK for Indriect PING to target {}", 
+                                    original_target,
+                                );
+                                self.send_ack(sender, original_sequence_number).await?;
+                            },
+                            Some(EventState::Completed) => {
+                                warn!("> Indirect PING to target {} exceeded deadline", original_target);
+                            },
+                            Some(other_state) => {
+                                warn!("> Unexpected event state: {:?}", other_state);
+                            },
+                            None => {
+                                warn!("> Event channel closed unexpectedly for target {}", original_target);
+                            }
+                        }
+                    },
+                    _ = tokio::time::sleep_until(deadline) => {
+                        warn!("Indirect PING deadline reached for target {}", original_target);
+                    }
+                }
+                
+            },
+            _ => {
+                warn!("Received non-Ping-Req message in PING_REQ from {}", sender);
+                return Err(anyhow!("Unexpected message type in PING_REQ"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_ack(&self, message_payload: MessagePayload) -> Result<()> {
+        match message_payload {
+            MessagePayload::Ack(payload) => {
+                if let Err(e) =  self.inner.event_manager.intercept_event(&EventType::Ack{sequence_number: payload.sequence_number}).await {
+                    warn!("event with seq number {} failed with {}", payload.sequence_number, e.to_string());
+                }
                 if payload.piggybacked_updates.len() > 0 {
                     self.handle_piggybacked_updates(payload.piggybacked_updates).await?;
                 }
@@ -654,50 +933,43 @@ impl<M: NodeMetadata> Gossipod<M> {
         }
        Ok(())
     }
-
-    async fn handle_no_ack(&self, message: Message) -> Result<()> {
-        unimplemented!()
-    }
-
-    async fn handle_ping_req(&self, message: Message) -> Result<()> {
-        unimplemented!()
-    }
-
-    async fn handle_ack(&self, message: Message) -> Result<()> {
-        unimplemented!()
-    }
      
     async fn handle_app_msg(&self, message: Message) -> Result<()> {
         unimplemented!()
     }
 
+    /// Processes incoming broadcast messages.
+    ///
+    /// This function is a critical component responsible for handling various types
+    /// of broadcast messages that propagate information about cluster membership and 
+    /// node states.
     pub(crate) async fn handle_broadcast(&self, message: Message) -> Result<()> {
         match message.payload {
             MessagePayload::Broadcast(broadcast) => {
                 match broadcast {
                     Broadcast::Suspect { incarnation, member } => {
                         debug!("Received SUSPECT broadcast for member: {}", member);
-                        self.handle_suspect_node(incarnation, &member).await?;
+                        self.suspect_node(incarnation, &member).await?;
                     },
                     Broadcast::Join { member } => {
                         debug!("Received JOIN broadcast for member: {}", member.name);
-                        if let Err(e) = self.handle_join_node(member).await {
+                        if let Err(e) = self.integrate_new_node(member).await {
                             warn!("unable to handle join node: {}", e.to_string())
                         }
                     },
                     Broadcast::Leave { incarnation, member } => {
                         debug!("Received LEAVE broadcast for member: {}", member);
-                        if let Err(e) = self.handle_leave_node(incarnation, &member).await {
+                        if let Err(e) = self.process_node_departure(incarnation, &member).await {
                             warn!("unable to handle leave node request")
                         }
                     },
                     Broadcast::Confirm { incarnation, member } => {
                         debug!("Received CONFIRM broadcast for member: {}", member);
-                        self.handle_confirm_node(incarnation, &member).await?;
+                        self.confirm_node(incarnation, &member).await?;
                     },
                     Broadcast::Alive { incarnation, member } => {
                         debug!("Received ALIVE broadcast for member: {}", member);
-                        self.handle_alive_node(incarnation, &member).await?;
+                        self.update_node_liveness(incarnation, &member).await?;
                     },
                 }
                 Ok(())
@@ -706,38 +978,38 @@ impl<M: NodeMetadata> Gossipod<M> {
         }
     }
 
-    pub(crate) async fn handle_suspect_node(&self, incarnation: u64, member: &str) -> Result<()> {
-        let node = match self.inner.members.get_node(member)? {
-            Some(n) => n,
-            None => {
-                warn!("Received suspect message for unknown node: {}", member);
-                return Ok(());
-            }
-        };
-
+    pub(crate) async fn suspect_node(&self, incarnation: u64, member: &str) -> Result<()> {
         // If the suspect message is about ourselves, we need to refute it
         if member == self.inner.config.name() {
             return self.refute_suspicion(incarnation).await;
         }
 
-        match self.inner.members.merge(&node) {
-            Ok(merge_result) => {
-                match merge_result.action {
-                    MergeAction::Updated => {
-                        info!("Node {} is now suspected", member);
-                        self.disseminate_suspect(node).await?;
-                    },
-                    MergeAction::Unchanged => {
-                        debug!("Node {} was already suspected", member);
-                    },
-                    _ => {
-                        warn!("Unexpected merge result when suspecting node {}", member);
+        if let Ok(Some(node)) = self.inner.members.get_node(member) {
+            let mut dup_node = node.clone();
+            dup_node.update_state(NodeState::Suspect)?;
+            dup_node.set_incarnation(incarnation);
+
+            match self.inner.members.merge(&dup_node) {
+                Ok(merge_result) => {
+                    match merge_result.action {
+                        MergeAction::Updated => {
+                            debug!("Node {} is now suspected", member);
+                            self.disseminate_suspect(node).await?;
+                        },
+                        MergeAction::Unchanged => {
+                            debug!("Node {} was already suspected", member);
+                        },
+                        _ => {
+                            warn!("Unexpected merge result when suspecting node {}", member);
+                        }
                     }
-                }
-            },
-            Err(e) => {
-                info!("Unable to merge node {}: {}", member, e);
-            },
+                },
+                Err(e) => {
+                    info!("Unable to merge node {}: {}", member, e);
+                },
+            }
+        } else {
+            warn!("Received suspect message for unknown node: {}", member);
         }
 
         Ok(())
@@ -753,7 +1025,6 @@ impl<M: NodeMetadata> Gossipod<M> {
             local_node.update_state(NodeState::Alive)?;
 
             info!("Refuting suspicion with new incarnation: {}", local_node.incarnation());
-
             self.inner.members.merge(&local_node)?;
             self.disseminate_alive(local_node).await?;
         }
@@ -816,6 +1087,22 @@ impl<M: NodeMetadata> Gossipod<M> {
             incarnation: node.incarnation(),
             member: node.name.clone(),
         };
+
+        match self.inner.members.merge(&updated_node) {
+            Ok(merge_result) => {
+                match merge_result.action {
+                    MergeAction::Updated => {
+                        if let Some(old_state) = merge_result.old_state {
+                            debug!("Node {} state changed from {:?} to {:?}", updated_node.name, old_state, merge_result.new_state);
+                        }
+                    },
+                    _ => {}
+                }
+            },
+            Err(e) => {
+                info!("Unable to merge node {}: {}", updated_node.name, e);
+            },
+        }
         self.broadcast_to_random_nodes(broadcast).await
     }
 
@@ -854,7 +1141,7 @@ impl<M: NodeMetadata> Gossipod<M> {
         Ok(())
     }
 
-    pub(crate) async fn handle_join_node(&self, member: RemoteNode) -> Result<()> {
+    pub(crate) async fn integrate_new_node(&self, member: RemoteNode) -> Result<()> {
         let metadata = M::from_bytes(&member.metadata)
             .context("Failed to deserialize node metadata")?;
     
@@ -907,8 +1194,8 @@ impl<M: NodeMetadata> Gossipod<M> {
         Ok(())
     }
 
-    async fn handle_leave_node(&self, incarnation: u64, member: &str) -> Result<()> {
-        println!("Leave incarnation: {}", incarnation);
+    async fn process_node_departure(&self, incarnation: u64, member: &str) -> Result<()> {
+        debug!("Leave incarnation: {}", incarnation);
 
         if let Ok(Some(node)) = self.inner.members.get_node(member) {
             let mut dup_node = node.clone();
@@ -947,7 +1234,7 @@ impl<M: NodeMetadata> Gossipod<M> {
         Ok(())
     }
 
-    async fn handle_confirm_node(&self, incarnation: u64, member: &str) -> Result<()> {
+    async fn confirm_node(&self, incarnation: u64, member: &str) -> Result<()> {
         let local_node = self.get_local_node().await?;
 
         // If it's about us, we need to refute
@@ -1009,8 +1296,10 @@ impl<M: NodeMetadata> Gossipod<M> {
         };
 
         self.broadcast_to_random_nodes(broadcast).await?;
-
-        info!("Refuted death confirmation by broadcasting Alive message with new incarnation {}", new_incarnation);
+        info!(
+            "Refuted death confirmation by broadcasting Alive message with new incarnation {}", 
+            new_incarnation,
+        );
         
         Ok(())
     }
@@ -1036,7 +1325,7 @@ impl<M: NodeMetadata> Gossipod<M> {
         Ok(())
     }
 
-    pub(crate) async fn handle_alive_node(&self, incarnation: u64, member: &str) -> Result<()> {
+    pub(crate) async fn update_node_liveness(&self, incarnation: u64, member: &str) -> Result<()> {
         match self.inner.members.get_node(member)? {
             Some(node) => {
                 let mut dup_node = node.clone();
