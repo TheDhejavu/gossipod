@@ -1,274 +1,229 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
-use std::borrow::Cow;
-use log::{info, warn};
-use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio::time::sleep;
-use anyhow::{anyhow, Result};
-
-use crate::message::MessagePayload;
+use std::time::{Duration};
+use tokio::sync::{RwLock, mpsc};
+use anyhow::{Result, anyhow};
+use tokio::time::Instant;
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum EventType {
-    Ping,
-    PingReq,
-    NoAck,
+pub(crate) enum EventType {
+    Ack { sequence_number: u64 },
+    SuspectTimeout { node: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EventState {
+pub(crate) enum EventState {
     Pending,
     Completed,
-    TimedOut,
+    Intercepted,
 }
 
-#[derive(Debug)]
-pub(crate) enum EventUpdate<'a> {
-    StateChange(Cow<'a, EventState>),
-    Message(Cow<'a, EventState>, Cow<'a, MessagePayload>),
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct EventId(u64);
+
+impl Ord for EventId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
 }
 
-#[derive(Debug)]
+impl PartialOrd for EventId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub(crate) struct Event {
-    event_type: EventType,
-    sequence_number: u64,
-    state: EventState,
-    sender: mpsc::Sender<EventUpdate<'static>>,
+    pub(crate) state: EventState,
+    pub(crate) sender: mpsc::Sender<EventState>,
 }
 
-impl Event {
-    /// Creates a new Event and returns it along with a receiver for updates.
-    fn new(event_type: EventType, sequence_number: u64) -> (Self, mpsc::Receiver<EventUpdate<'static>>) {
-        let (sender, receiver) = mpsc::channel(10);
-        (
-            Self {
-                event_type,
-                sequence_number,
-                state: EventState::Pending,
-                sender,
-            },
-            receiver,
-        )
-    }
-
-    /// Updates the state of the event and sends an update through the channel.
-    async fn update_state(&mut self, new_state: EventState, payload: Option<MessagePayload>) -> Result<()> {
-        self.state = new_state.clone();
-        let update = match payload {
-            Some(payload) => EventUpdate::Message(Cow::Owned(new_state), Cow::Owned(payload)),
-            None => EventUpdate::StateChange(Cow::Owned(new_state)),
-        };
-        self.sender.send(update).await.map_err(|e| anyhow!("failed to send event update: {}", e))
-    }
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct EventManager {
-    events: Arc<Mutex<HashMap<(EventType, u64), Event>>>,
-    cleanup_interval: Duration,
-    shutdown_tx: broadcast::Sender<()>,
-    is_shutting_down: Arc<AtomicBool>,
+    events: Arc<RwLock<BinaryHeap<(Instant, EventId)>>>,
+    event_map: Arc<RwLock<HashMap<EventType, (EventId, Event)>>>,
+    event_counter: std::sync::atomic::AtomicU64,
 }
 
 impl EventManager {
-    /// Creates a new EventManager.
-    pub(crate) fn new(cleanup_interval: Duration) -> Self {
-        let (shutdown_tx, _) = broadcast::channel(1);
-
-        let manager = Self {
-            events: Arc::new(Mutex::new(HashMap::new())),
-            cleanup_interval,
-            shutdown_tx,
-            is_shutting_down: Arc::new(AtomicBool::new(false)),
-        };
-        manager.start_cleanup_task();
-        manager
+    pub(crate) fn new() -> Self {
+        EventManager {
+            events: Arc::new(RwLock::new(BinaryHeap::new())),
+            event_map: Arc::new(RwLock::new(HashMap::new())),
+            event_counter: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
-    /// Creates a new event and returns a receiver for updates on that event.
-    pub(crate) async fn create_event(
+    /// Schedules a new event with a specified type and deadline.
+    /// Returns a receiver to monitor the event state.
+    pub(crate) async fn schedule_event(
         &self,
         event_type: EventType,
-        sequence_number: u64,
-        timeout: Duration,
-    ) -> Result<mpsc::Receiver<EventUpdate<'static>>> {
-        if self.is_shutting_down().await {
-            return Err(anyhow!("EventManager is shutting down, cannot create new events"));
+        deadline: Instant,
+    ) -> Result<mpsc::Receiver<EventState>> {
+        let mut event_map = self.event_map.write().await;
+        if event_map.contains_key(&event_type) {
+            return Err(anyhow!("An event of this type already exists"));
         }
 
-        let (event, receiver) = Event::new(event_type.clone(), sequence_number);
-        let event_key = (event_type, sequence_number);
+        let (sender, receiver) = mpsc::channel(10);
+        let id = EventId(self.event_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
 
-        let mut events = self.events.lock().await;
-        events.insert(event_key.clone(), event);
+        let event = Event {
+            state: EventState::Pending,
+            sender,
+        };
 
-        if let Err(e) = self.spawn_timeout_task(event_key, timeout) {
-            warn!("unable to spawn timeout task: {}", e.to_string());
-        }
+        event_map.insert(event_type, (id.clone(), event));
+        self.events.write().await.push((deadline, id));
 
         Ok(receiver)
     }
 
-    /// Retrieves the current state of an event.
-    pub(crate) async fn get_event_state(&self, event_seq_num: u64, event_type: EventType) -> Result<EventState> {
-        let events = self.events.lock().await;
-        events.get(&(event_type, event_seq_num))
-            .map(|event| event.state.clone())
-            .ok_or_else(|| anyhow!("event not found"))
-    }
-
-    /// Handles an incoming event, updating its state if it matches a pending event.
-    pub async fn handle_event(&self, sequence_number: u64, event_type: &EventType, payload: &MessagePayload) -> Result<()> {
-        let mut events = self.events.lock().await;
-        if let Some(e) = events.get_mut(&(event_type.clone(), sequence_number)) {
-            if e.state == EventState::Pending {
-                return e.update_state(EventState::Completed, Some(payload.clone())).await;
+    /// Retrieves the next event that has reached its deadline.
+    /// Returns the event type and event details if any.
+    pub(crate) async fn next_event(&self) -> Option<(EventType, Event)> {
+        let now = Instant::now();
+        let mut events = self.events.write().await;
+        let mut event_map = self.event_map.write().await;
+        
+        while let Some((time, id)) = events.pop() {
+            if time <= now {
+                // Find and remove the event from the event_map
+                let event_entry = event_map.iter()
+                    .find(|(_, (event_id, _))| event_id == &id)
+                    .map(|(event_type, _)| event_type.clone());
+    
+                if let Some(event_type) = event_entry {
+                    if let Some((_, event)) = event_map.remove(&event_type) {
+                        return Some((event_type,  Event { 
+                            state: EventState::Completed, 
+                            sender: event.sender
+                        }));
+                    }
+                }
+            } else {
+                // If the event is in the future, put it back and stop searching
+                events.push((time, id));
+                break;
             }
         }
-        Err(anyhow!("unable to get event, probably a case of an expired or already completed event"))
+        None
     }
 
-    /// Removes all non-pending events from the event map.
-    pub(crate) async fn cleanup(&self) {
-        let mut events = self.events.lock().await;
-        events.retain(|_, event| event.state == EventState::Pending);
-    }
-
-    /// Spawns a task that will time out an event after a specified duration.
-    fn spawn_timeout_task(&self, event_key: (EventType, u64), timeout: Duration) -> Result<()> {
-        let events_clone = self.events.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = sleep(timeout) => {
-                    let mut events = events_clone.lock().await;
-                    if let Some(event) = events.get_mut(&event_key) {
-                        if event.state == EventState::Pending {
-                            if let Err(e) = event.update_state(EventState::TimedOut, None).await {
-                                warn!("unable to update state to timeout due to: {}", e.to_string())
-                            }
-                        }
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("[RECV] Timeout task shutting down");
-                }
+    /// Calculates the duration until the next event is due.
+    /// Returns the duration if an event is found, or None if there are no events.
+    pub(crate) async fn time_to_next_event(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let events = self.events.read().await;
+        
+        events.peek().map(|(time, _)| {
+            if *time > now {
+                *time - now
+            } else {
+                Duration::from_secs(0)
             }
-        });
-        Ok(())
+        })
     }
 
-    /// Starts the cleanup task.
-    fn start_cleanup_task(&self) {
-        let interval = self.cleanup_interval;
-        let this = self.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+    /// Retrieves all events that are due up to the current time.
+    /// Returns a vector of event types and event details.
+    pub(crate) async fn next_events(&self) -> Vec<(EventType, Event)> {
+        let now = Instant::now();
+        let mut events = self.events.write().await;
+        let mut event_map = self.event_map.write().await;
+        let mut due_events = Vec::new();
+        
+        while let Some((time, _)) = events.peek() {
+            if *time <= now {
+                let id = events.pop().unwrap().1;
+                let event_entry = event_map.iter()
+                    .find(|(_, (event_id, _))| event_id == &id)
+                    .map(|(event_type, _)| event_type.clone());
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = sleep(interval) => {
-                        this.cleanup().await;
-                    }
-                    _ = shutdown_rx.recv() => {
-                        info!("[RECV] Cleanup task shutting down");
-                        break;
+                if let Some(event_type) = event_entry {
+                    if let Some((_, event)) = event_map.remove(&event_type) {
+                        due_events.push((event_type, Event { 
+                            state: EventState::Completed, 
+                            sender: event.sender
+                        }));
                     }
                 }
-            }
-        });
-    }
-
-    /// Initiates shutdown of the EventManager.
-    pub async fn shutdown(&self) -> Result<()> {
-        info!("Initiating EventManager shutdown");
-        self.is_shutting_down.store(true, Ordering::SeqCst);
-
-        // Timeout all events in order to release all processes waiting for its completion
-        let mut events = self.events.lock().await;
-        for (_, event) in events.iter_mut() {
-            if event.state == EventState::Pending {
-                if let Err(e) = event.update_state(EventState::TimedOut, None).await {
-                    warn!("failed to update event state during shutdown: {}", e);
-                }
+            } else {
+                break;
             }
         }
-        events.clear();
-
-        info!("EventManager shutdown complete");
-        Ok(())
+        due_events
+    }
+    
+    /// Intercepts a specified event, changing its state to Intercepted.
+    /// Removes the event from both the event map and the event heap.
+    pub(crate) async fn intercept_event(&self, event_type: &EventType) -> Result<()> {
+        let mut event_map = self.event_map.write().await;
+        
+        if let Some((id, event)) = event_map.remove(event_type) {
+            let _ = event.sender.send(EventState::Intercepted).await;
+            // Remove the event from the events heap as well
+            let mut events = self.events.write().await;
+            events.retain(|&(_, ref e_id)| e_id != &id);
+            
+            Ok(())
+        } else {
+            Err(anyhow!("Event not found"))
+        }
     }
 
-    /// Checks if the EventManager is currently shutting down.
-    async fn is_shutting_down(&self) -> bool {
-        self.is_shutting_down.load(Ordering::SeqCst)
+    /// Cancels a specified event by intercepting it.
+    pub(crate) async fn cancel_event(&self, event_type: &EventType) -> Result<()> {
+        self.intercept_event(event_type).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::timeout;
-    use crate::message::{NoAckPayload, PingPayload};
+    use tokio::time::{sleep, timeout};
 
     #[tokio::test]
-    async fn test_create_and_handle_event() {
-        let manager = EventManager::new(Duration::from_secs(60));
-        let sequence_number = 1;
-        let mut rx = manager.create_event(EventType::NoAck, sequence_number, Duration::from_secs(5)).await.unwrap();
-
-        let payload = MessagePayload::NoAck(NoAckPayload { sequence_number: 0 });
-        manager.handle_event(sequence_number, &EventType::NoAck, &payload).await.expect("handle event failed");
-
-        if let Ok(Some(EventUpdate::Message(state, _))) = timeout(Duration::from_secs(1), rx.recv()).await {
-            assert_eq!(*state, EventState::Completed);
-        } else {
-            panic!("expected completed event within 1 second but none was received");
-        }
+    async fn test_schedule_and_next_event() {
+        let manager = EventManager::new();
+        let now = Instant::now();
+        let event_type = EventType::SuspectTimeout { node: "node".to_string() };
+        
+        manager.schedule_event(event_type.clone(), now + Duration::from_millis(100)).await.unwrap();
+        
+        sleep(Duration::from_millis(110)).await;
+        
+        let event = manager.next_event().await;
+        assert!(event.is_some());
+        let (returned_type, _) = event.unwrap();
+        assert_eq!(returned_type, event_type);
     }
 
     #[tokio::test]
-    async fn test_event_timeout() {
-        let manager = EventManager::new(Duration::from_secs(60));
-        let sequence_number = 1;
-        let mut rx = manager.create_event(EventType::Ping, sequence_number, Duration::from_millis(10)).await.unwrap();
-
-        if let Ok(Some(EventUpdate::StateChange(state))) = timeout(Duration::from_millis(20), rx.recv()).await {
-            assert_eq!(*state, EventState::TimedOut);
-        } else {
-            panic!("expected timeout event within 20 milliseconds but none was received");
-        }
+    async fn test_intercept_event() {
+        let manager = EventManager::new();
+        let now = Instant::now();
+        let event_type = EventType::SuspectTimeout { node: "node".to_string() };
+        
+        let mut receiver = manager.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await.unwrap();
+        
+        manager.intercept_event(&event_type).await.unwrap();
+        
+        let result = timeout(Duration::from_millis(100), receiver.recv()).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(EventState::Intercepted));
     }
 
     #[tokio::test]
-    async fn test_cleanup() {
-        let manager = EventManager::new(Duration::from_millis(100));
-        let sequence_number = 1;
-        manager.create_event(EventType::Ping, sequence_number, Duration::from_millis(50)).await.unwrap();
-
-        // Wait for the cleanup task to run
-        sleep(Duration::from_millis(200)).await;
-
-        let state = manager.get_event_state(sequence_number, EventType::Ping).await;
-        assert!(state.is_err(), "Event should have been cleaned up");
-    }
-
-    #[tokio::test]
-    async fn test_shutdown() {
-        let manager = EventManager::new(Duration::from_secs(60));
-        let sequence_number = 1;
-        let _ = manager.create_event(EventType::Ping, sequence_number, Duration::from_secs(5)).await.unwrap();
-
-        manager.shutdown().await.expect("Shutdown failed");
-
-        // Try to create a new event after shutdown
-        let result = manager.create_event(EventType::Ping, 2, Duration::from_secs(5)).await;
-        assert!(result.is_err(), "Should not be able to create event after shutdown");
-
-        // Check that all events are cleared
-        let events = manager.events.lock().await;
-        assert!(events.is_empty(), "All events should be cleared after shutdown");
+    async fn test_duplicate_event_type() {
+        let manager = EventManager::new();
+        let now = Instant::now();
+        let event_type = EventType::SuspectTimeout { node: "node".to_string() };
+        
+        manager.schedule_event(event_type.clone(), now).await.unwrap();
+        let result = manager.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await;
+        
+        assert!(result.is_err());
     }
 }

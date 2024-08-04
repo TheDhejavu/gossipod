@@ -95,7 +95,7 @@ impl<M: NodeMetadata> Membership<M> {
     /// Selects a specified number of random nodes from the membership list, with an optional exclusion predicate.
     pub(crate) fn select_random_nodes<F>(&self, count: usize, exclude: Option<F>) -> Result<Vec< Node<M>>>
     where
-        F: Fn(& Node<M>) -> bool,
+        F: Fn(&Node<M>) -> bool,
     {
         self.read_operation(|nodes| {
             let eligible_nodes: Vec<_> = nodes.values()
@@ -217,7 +217,6 @@ impl<M: NodeMetadata> Membership<M> {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
-
     use crate::DefaultMetadata;
 
     use super::*;

@@ -10,6 +10,24 @@ use std::cmp::Ordering;
 use std::any::type_name;
 use crate::state::NodeState;
 
+#[derive(Eq, PartialEq)]
+pub(crate) struct NodePriority<M: NodeMetadata> {
+    pub(crate) last_probed: SystemTime,
+    pub(crate) node: Node<M>,
+}
+
+impl<M: NodeMetadata> Ord for NodePriority<M> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.last_probed.cmp(&self.last_probed)
+    }
+}
+
+impl<M: NodeMetadata> PartialOrd for NodePriority<M> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct NodeStatus {
     incarnation: u64,
@@ -31,8 +49,7 @@ impl NodeStatus {
     pub(crate) fn update_state(&mut self, new_state: NodeState) -> Result<()> {
         self.state = new_state;
         self.last_updated = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("unable to get time ")?
+            .duration_since(UNIX_EPOCH)?
             .as_millis();
 
         Ok(())
@@ -43,8 +60,7 @@ impl NodeStatus {
     fn increment_incarnation(&mut self) -> Result<()> {
         self.incarnation += 1;
         self.last_updated = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("unable to get time ")?
+            .duration_since(UNIX_EPOCH)?
             .as_millis();
 
         Ok(())
@@ -271,7 +287,7 @@ impl<M: NodeMetadata> Node<M> {
     /// It resolves conflicts based on the following rules:
     /// 1. If the other node has a higher incarnation, all its data is adopted.
     /// 2. If incarnations are equal, the node with the higher precedence state wins.
-    /// 3. If states are equal, the node with the most recent update wins.
+    /// 3. If states are equal, the node with the most recent update wins (similar to how CRDT(LWW) works).
     ///
     /// This is slightly deviated a little bit from the original SWIM paper that 
     /// mostly resolve conflicting data based on incarnation number alone, this is subject to
@@ -280,52 +296,49 @@ impl<M: NodeMetadata> Node<M> {
     /// The function also handles metadata, IP address, and port changes.
     /// Logs warnings for any detected differences in IP address, port, or metadata.
     pub fn merge(&mut self, other: &Node<M>) -> Result<bool> {
-        // Check for IP address differences
-        if self.ip_addr != other.ip_addr {
-            warn!("IP address changed from {} to {}", self.ip_addr, other.ip_addr);
-        }
-
-        // Check for port differences
-        if self.port != other.port {
-            warn!("Port changed from {} to {}", self.port, other.port);
-        }
-
-        // Check for metadata differences
-        if self.metadata != other.metadata {
-            warn!("Metadata has changed");
-        }
-
-        let self_status = &mut self.status;
-        let other_status = &other.status;
-
-        match self_status.incarnation.cmp(&other_status.incarnation) {
+        // Thoughts:
+        // what if a node restarted and incarnation starts counting from 0, and the node rejoins, and by default node
+        // has already been moved to a dead or suspect state on remote memeberhsip of nodes, how can i modify to make it work
+        // There has to be a way to move incarnation ahead.
+        match self.status.incarnation.cmp(&other.status.incarnation) {
             Ordering::Less => {
-                *self_status = other_status.clone();
-                self.metadata = other.metadata.clone();
-                self.ip_addr = other.ip_addr;
-                self.port = other.port;
+                self.update_all(other);
+                self.log_differences(other);
                 Ok(true)
             }
             Ordering::Equal => {
-                if other_status.state.precedence() > self_status.state.precedence() {
-                    self_status.update_state(other_status.state.clone())?;
-                    self_status.last_updated = other_status.last_updated;
-                    self.metadata = other.metadata.clone();
-                    self.ip_addr = other.ip_addr;
-                    self.port = other.port;
-                    Ok(true)
-                } else if other_status.state == self_status.state && other_status.last_updated > self_status.last_updated {
-                    self_status.last_updated = other_status.last_updated;
-                    self.metadata = other.metadata.clone();
-                    self.ip_addr = other.ip_addr;
-                    self.port = other.port;
+                if other.status.state.precedence() > self.status.state.precedence() 
+                   || (other.status.state == self.status.state && other.status.last_updated > self.status.last_updated)
+                   || (self.status.state == NodeState::Dead && other.status.state == NodeState::Alive) {
+                    self.update_all(other);
+                    self.log_differences(other);
                     Ok(true)
                 } else {
                     Ok(false)
                 }
             }
-            Ordering::Greater => Ok(false), // No-Op
+            Ordering::Greater => Ok(false),
         }
+    }
+
+    /// Check and log changes
+    fn log_differences(&self, other: &Node<M>) {
+        if self.ip_addr != other.ip_addr {
+            warn!("IP address changed from {} to {}", self.ip_addr, other.ip_addr);
+        }
+        if self.port != other.port {
+            warn!("Port changed from {} to {}", self.port, other.port);
+        }
+        if self.metadata != other.metadata {
+            warn!("Metadata has changed");
+        }
+    }
+
+    fn update_all(&mut self, other: &Node<M>) {
+        self.status = other.status.clone();
+        self.metadata = other.metadata.clone();
+        self.ip_addr = other.ip_addr;
+        self.port = other.port;
     }
 
     /// Checks if the Node has been in the Suspect state for longer than the given timeout.
@@ -335,8 +348,7 @@ impl<M: NodeMetadata> Node<M> {
         }
 
         let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .duration_since(UNIX_EPOCH)?
             .as_secs();
 
         let time_in_suspect_state = now.saturating_sub(self.status.last_updated.try_into()?);
