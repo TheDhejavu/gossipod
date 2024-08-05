@@ -1,4 +1,3 @@
-use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
@@ -8,15 +7,15 @@ use event_manager::{EventState, EventType};
 use log::*;
 use members::MergeAction;
 use message::{AckPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
-use node::NodePriority;
 pub use node::{DefaultMetadata, NodeMetadata};
 use notifer::Notifier;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc};
+use parking_lot::RwLock;
 use tokio::time::{self, Instant};
 use tokio_util::bytes::{BufMut, BytesMut};
 use utils::pretty_debug;
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use crate::{
     config::{GossipodConfig, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT, MAX_CONSECUTIVE_FAILURES},
     event_manager::EventManager,
@@ -25,7 +24,7 @@ use crate::{
     members::Membership,
     message::{Message, NetSvc, RemoteNode},
     node::Node,
-    retry_state::RetryState,
+    backoff::BackOff,
     state::NodeState,
     transport::Transport,
 };
@@ -39,7 +38,7 @@ mod node;
 mod members;
 mod listener;
 mod codec;
-mod retry_state;
+mod backoff;
 mod event_manager;
 mod notifer;
 mod utils;
@@ -237,12 +236,12 @@ impl<M: NodeMetadata> Gossipod<M> {
 
         let tcp_handle = Self::spawn_tcp_listener_with_retry(
             self.inner.transport.clone(),
-            RetryState::new(),
+            BackOff::new(),
             self.inner.shutdown.subscribe(),
         );
         let udp_handle = Self::spawn_udp_listener_with_retry(
             self.inner.transport.clone(),
-            RetryState::new(),
+            BackOff::new(),
             self.inner.shutdown.subscribe(),
         );
         let scheduler_handle = self.spawn_scheduler(self.inner.shutdown.subscribe());
@@ -323,7 +322,7 @@ impl<M: NodeMetadata> Gossipod<M> {
 
     fn spawn_tcp_listener_with_retry(
         transport: Transport,
-        mut retry_state: RetryState,
+        mut backoff: BackOff,
         mut shutdown_rx: broadcast::Receiver<()>
     ) -> tokio::task::JoinHandle<Result<()>> {
         tokio::spawn(async move {
@@ -331,18 +330,16 @@ impl<M: NodeMetadata> Gossipod<M> {
                 tokio::select! {
                     listener_result = transport.tcp_stream_listener() => {
                         match listener_result {
-                            Ok(_) => {
-                                retry_state.record_success();
-                            }
+                            Ok(_) =>  backoff.reset(),
                             Err(e) => {
-                                let failures = retry_state.record_failure();
+                                let failures = backoff.inc_failure();
                                 error!("TCP listener error: {}. Consecutive failures: {}", e, failures);
                                 
                                 if failures >= MAX_CONSECUTIVE_FAILURES {
                                     return Err(anyhow!("TCP listener failed {} times consecutively", failures));
                                 }
             
-                                let delay = retry_state.calculate_delay();
+                                let delay = backoff.calculate_delay();
                                 warn!("TCP listener restarting in {:?}", delay);
                                 
                                 tokio::select! {
@@ -366,7 +363,7 @@ impl<M: NodeMetadata> Gossipod<M> {
     
     fn spawn_udp_listener_with_retry(
         transport: Transport,
-        mut retry_state: RetryState,
+        mut backoff: BackOff,
         mut shutdown_rx: broadcast::Receiver<()>
     ) -> tokio::task::JoinHandle<Result<()>> {
         tokio::spawn(async move {
@@ -374,18 +371,16 @@ impl<M: NodeMetadata> Gossipod<M> {
                 tokio::select! {
                     listener_result = transport.udp_socket_listener() => {
                         match listener_result {
-                            Ok(_) => {
-                                retry_state.record_success();
-                            }
+                            Ok(_) =>  backoff.reset(),
                             Err(e) => {
-                                let failures = retry_state.record_failure();
+                                let failures = backoff.inc_failure();
                                 error!("UDP listener error: {}. Consecutive failures: {}", e, failures);
                                 
                                 if failures >= MAX_CONSECUTIVE_FAILURES {
                                     return Err(anyhow!("TCP listener failed {} times consecutively", failures));
                                 }
             
-                                let delay = retry_state.calculate_delay();
+                                let delay = backoff.calculate_delay();
                                 warn!("UDP listener restarting in {:?}", delay);
                                 
                                 tokio::select! {
@@ -784,12 +779,21 @@ impl<M: NodeMetadata> Gossipod<M> {
     async fn handle_ping(&self, sender: SocketAddr, message_payload: MessagePayload) -> Result<()> {
         match message_payload {
             MessagePayload::Ping(payload) => {
-                debug!("Received PING from {}", sender);
-                self.send_ack(sender, payload.sequence_number).await?;
-    
-                // Handle piggybacked updates
+                let this = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = this.send_ack(sender, payload.sequence_number).await {
+                        error!("Failed to send ACK: {}", e);
+                    }
+                });
+
                 if !payload.piggybacked_updates.is_empty() {
-                    self.handle_piggybacked_updates(payload.piggybacked_updates).await?;
+                    let this = self.clone();
+                    let updates = payload.piggybacked_updates;
+                    tokio::spawn(async move {
+                        if let Err(e) = this.handle_piggybacked_updates(updates).await {
+                            error!("Failed to handle piggybacked updates: {}", e);
+                        }
+                    });
                 }
             },
             _ => {
@@ -1478,7 +1482,7 @@ impl<M: NodeMetadata> Gossipod<M> {
     }
     
     pub async fn stop(&self) -> Result<()> {
-        let mut state = self.inner.state.write().await;
+        let mut state = self.inner.state.write();
         match *state {
             GossipodState::Running => {
                 self.inner.shutdown.send(()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -1491,11 +1495,11 @@ impl<M: NodeMetadata> Gossipod<M> {
     }
     
     pub async fn is_running(&self) -> bool {
-        matches!(*self.inner.state.read().await, GossipodState::Running)
+        matches!(*self.inner.state.read(), GossipodState::Running)
     }
 
     async fn set_state(&self, gossipod_state: GossipodState) -> Result<()> {
-        let mut state = self.inner.state.write().await;
+        let mut state = self.inner.state.write();
         *state = gossipod_state;
         Ok(())
     }

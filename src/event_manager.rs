@@ -46,6 +46,7 @@ pub(crate) struct EventManager {
 }
 
 impl EventManager {
+    // Create new EventManager Instance
     pub(crate) fn new() -> Self {
         EventManager {
             events: Arc::new(RwLock::new(BinaryHeap::new())),

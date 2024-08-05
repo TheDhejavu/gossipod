@@ -112,7 +112,6 @@ let gossipod = Gossipod::new(config).await?;
 #### With custom node metadata
 
 ```rust
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 struct Metadata {
     region: String,
@@ -122,90 +121,20 @@ struct Metadata {
 impl NodeMetadata for Metadata {}
 
 let metadata = Metadata { 
-        region: "aws-west-1".to_string(),
-        datacenter: "dc1".to_string(),
-    };
+    region: "aws-west-1".to_string(),
+    datacenter: "dc1".to_string(),
+};
 
-let gossipod = Gossipod::with_metadata(config, metadata)
-        .await
-        .context("Failed to initialize Gossipod with custom metadata")?;
+let gossipod = Gossipod::with_metadata(config, metadata).await?;
 ```
 
-
-### Starting Gossipod
-
-```rust
-gossipod.start().await
-```
-
-Starts the Gossipod service. This should be run in a separate task.
-
-### Checking if Gossipod is running
-
-```rust
-gossipod.is_running().await
-```
-
-Returns a boolean indicating whether the Gossipod service is currently running.
-
-### Stopping Gossipod
-
-```rust
-gossipod.stop().await
-```
-
-Stops the Gossipod service.
-
-### Getting the local node information
-
-```rust
-gossipod.get_local_node().await
-```
-
-Returns information about the local node.
-
-## Communication
-
-### Setting up a receiver
-
-```rust
-let receiver = gossipod.with_receiver(channel_size).await
-```
-
-Sets up a channel to receive incoming messages.
-
-### Sending a message
-
-```rust
-gossipod.send(target_socket_addr, &serialized_message).await
-```
-
-Sends a message to a specific target node.
-
-## Membership
-
-### Getting the list of members
-
-```rust
-gossipod.members().await
-```
-
-Returns a list of all `alive` members in the cluster.
-
-## Configuration
-
-The `GossipodConfigBuilder` allows you to configure various aspects of the Gossipod instance:
-
-- `name(String)`: Sets the name of the node
-- `port(u16)`: Sets the port to bind to
-- `addr(Ipv4Addr)`: Sets the IP address to bind to
-- `ping_timeout(Duration)`: Sets the timeout for ping operations
 
 ## Example Usage
 
 Here's a basic example of how to use Gossipod in your application:
 
 ```rust
+// Configuration
 let config = GossipodConfigBuilder::new()
     .name("NODE_1")
     .port(7948)
@@ -214,6 +143,7 @@ let config = GossipodConfigBuilder::new()
     .build()
     .await?;
 
+// New instance
 let gossipod = Arc::new(Gossipod::new(config.clone()).await?);
 
 // Start Gossipod
@@ -225,12 +155,12 @@ while !gossipod.is_running().await {
 }
 
 // Set up a receiver
-let mut msg_ch = gossipod.with_receiver(100).await;
+let mut receiver = gossipod.with_receiver(100).await;
 
 // Main loop
 loop {
     tokio::select! {
-        Some(data) = msg_ch.recv() => {
+        Some(data) = receiver.recv() => {
             // Handle incoming message
         }
         _ = tokio::signal::ctrl_c() => {

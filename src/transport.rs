@@ -7,17 +7,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use anyhow::{Result, Context, anyhow};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
+use parking_lot::RwLock;
 use crate::config::{DEFAULT_CHANNEL_BUFFER_SIZE, DEFAULT_MESSAGE_BUFFER_SIZE, MAX_UDP_PACKET_SIZE};
 use crate::message::Message;
 
 type NetworkTcpStream = (SocketAddr, TcpStream);
 type NetworkUdpSocket = (SocketAddr, Vec<u8>);
 
-
 /// Transport is responsible for sending messages to peers
 #[derive(Clone)]
-pub(crate) struct Transport{
+pub(crate) struct Transport {
     pub(crate) port: u16,
     pub(crate) ip_addr: IpAddr,
     // Local TCP listener, the idea is for TCP to handle node-specific messages where reliability and connection
@@ -49,7 +49,7 @@ impl NodeTransport for Transport {
     async fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpStream> {
         timeout(self.dial_timeout, TcpStream::connect(addr))
             .await
-            .context("TCP connection timed out")?
+            .map_err(|_| anyhow!("TCP connection timed out"))?
             .context("Failed to establish TCP connection")
     }
 
@@ -57,7 +57,7 @@ impl NodeTransport for Transport {
     async fn write_to_tcp(&self, stream: &mut TcpStream, message: &[u8]) -> Result<()> {
         timeout(self.dial_timeout, stream.write_all(message))
             .await
-            .context("TCP write timed out")?
+            .map_err(|_| anyhow!("TCP write timed out"))?
             .context("Failed to write to TCP stream")
     }
 
@@ -67,11 +67,13 @@ impl NodeTransport for Transport {
             return Err(anyhow!("Message too large for UDP packet, allowed {}bytes but got {}bytes", MAX_UDP_PACKET_SIZE, message.len()));
         }
 
-        let udp_socket = self.udp_socket.read().await;
-        let socket = udp_socket.as_ref().ok_or_else(|| anyhow!("UDP socket not initialized"))?;
+        let socket = self.udp_socket.read().as_ref()
+            .ok_or_else(|| anyhow!("UDP socket not initialized"))?
+            .clone();
+
         timeout(self.dial_timeout, socket.send_to(message, addr))
             .await
-            .context("UDP send timed out")?
+            .map_err(|_| anyhow!("UDP send timed out"))?
             .map(|_| ())
             .context("Failed to send UDP message")
     }
@@ -102,8 +104,9 @@ impl Transport {
 
     /// Listens for incoming TCP connections
     pub(crate) async fn tcp_stream_listener(&self) -> Result<()> {
-        let tcp_listener = self.tcp_listener.read().await;
-        let listener = tcp_listener.as_ref().context("TCP listener not initialized")?;
+        let listener = self.tcp_listener.read().as_ref()
+            .ok_or_else(|| anyhow!("TCP listener not initialized"))?
+            .clone();
         let tcp_stream_tx = self.tcp_stream_tx.clone();
 
         loop {
@@ -121,10 +124,9 @@ impl Transport {
 
     /// Listens for incoming UDP messages
     pub(crate) async fn udp_socket_listener(&self) -> Result<()> {
-        let socket = {
-            let udp_socket = self.udp_socket.read().await;
-            udp_socket.as_ref().context("UDP socket not initialized")?.clone()
-        };
+        let socket = self.udp_socket.read().as_ref()
+            .ok_or_else(|| anyhow!("UDP socket not initialized"))?
+            .clone();
         let udp_socket_tx = self.udp_socket_tx.clone();
     
         let mut buf = vec![0u8; DEFAULT_MESSAGE_BUFFER_SIZE];
@@ -132,7 +134,7 @@ impl Transport {
             match socket.recv_from(&mut buf).await {
                 Ok((len, addr)) => {
                     info!("[RECV] Incoming UDP message from: {}", addr);
-                    if let Err(e) = udp_socket_tx.send((addr, (&buf[..len]).to_vec())).await {
+                    if let Err(e) = udp_socket_tx.send((addr, buf[..len].to_vec())).await {
                         warn!("Failed to send UDP message to channel: {:?}", e);
                     }
                 }
@@ -145,8 +147,7 @@ impl Transport {
     pub(crate) async fn bind_tcp_listener(&self) -> Result<()> {
         let bind_addr = SocketAddr::new(self.ip_addr, self.port);
         let listener = TokioTcpListener::bind(bind_addr).await?;
-        let mut tcp_listener = self.tcp_listener.write().await;
-        *tcp_listener = Some(Arc::new(listener));
+        *self.tcp_listener.write() = Some(Arc::new(listener));
         Ok(())
     }
 
@@ -154,8 +155,7 @@ impl Transport {
     pub(crate) async fn bind_udp_socket(&self) -> Result<()> {
         let bind_addr = SocketAddr::new(self.ip_addr, self.port);
         let socket = TokioUdpSocket::bind(bind_addr).await?;
-        let mut udp_socket = self.udp_socket.write().await;
-        *udp_socket = Some(Arc::new(socket));
+        *self.udp_socket.write() = Some(Arc::new(socket));
         Ok(())
     }
 

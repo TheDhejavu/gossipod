@@ -100,11 +100,7 @@ async fn main() -> Result<()> {
                 Some(msg) = receiver.recv() => {
                     println!("Received app message: {:?}", msg);
                 }
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    // Modify the channel every 60 seconds
-                    // receiver = gossipod_clone.with_receiver(200).await;
-                    // println!("App message channel modified with new buffer size");
-                }
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
             }
         }
     });
