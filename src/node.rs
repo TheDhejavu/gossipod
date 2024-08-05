@@ -10,15 +10,18 @@ use std::cmp::Ordering;
 use std::any::type_name;
 use crate::state::NodeState;
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub(crate) struct NodePriority<M: NodeMetadata> {
-    pub(crate) last_probed: SystemTime,
-    pub(crate) node: Node<M>,
+    pub(crate) last_piggybacked: SystemTime,
+    pub(crate) name: String,
+    pub(crate) _marker: std::marker::PhantomData<M>,
 }
 
 impl<M: NodeMetadata> Ord for NodePriority<M> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.last_probed.cmp(&self.last_probed)
+        // TODO: Potential Improvement:
+        // - Combine least-recently-piggybacked with priority for recent state changes.
+        other.last_piggybacked.cmp(&self.last_piggybacked)
     }
 }
 
@@ -296,49 +299,121 @@ impl<M: NodeMetadata> Node<M> {
     /// The function also handles metadata, IP address, and port changes.
     /// Logs warnings for any detected differences in IP address, port, or metadata.
     pub fn merge(&mut self, other: &Node<M>) -> Result<bool> {
-        // Thoughts:
-        // what if a node restarted and incarnation starts counting from 0, and the node rejoins, and by default node
-        // has already been moved to a dead or suspect state on remote memeberhsip of nodes, how can i modify to make it work
-        // There has to be a way to move incarnation ahead.
+        if self.name != other.name {
+            return Err(anyhow::anyhow!("Cannot merge nodes with different names"));
+        }
+
+        // Check if we're leaving the cluster
+        if self.state() == NodeState::Leaving {
+            return Ok(false);
+        }
+
+        let mut changed = false;
+
+        // Handle incarnation number conflicts
         match self.status.incarnation.cmp(&other.status.incarnation) {
             Ordering::Less => {
-                self.update_all(other);
-                self.log_differences(other);
-                Ok(true)
+                // Other node has a higher incarnation, accept all its data
+                changed |= self.handle_higher_incarnation(other);
             }
             Ordering::Equal => {
-                if other.status.state.precedence() > self.status.state.precedence() 
-                   || (other.status.state == self.status.state && other.status.last_updated > self.status.last_updated)
-                   || (self.status.state == NodeState::Dead && other.status.state == NodeState::Alive) {
-                    self.update_all(other);
-                    self.log_differences(other);
-                    Ok(true)
-                } else {
-                    Ok(false)
+                changed |= self.resolve_equal_incarnation(other);
+            }
+            Ordering::Greater => {
+                warn!("Received update for node '{}' with lower incarnation {} (current is {})",
+              self.name, other.status.incarnation, self.status.incarnation);
+
+                // Our incarnation is higher, but check for the restart scenario
+                if self.state() == NodeState::Dead && other.state() == NodeState::Alive {
+                    // Allow a "DEAD" node to come back to life, even with a lower incarnation
+                    // The downside here is that it's hard to tell if the message that triggered this 
+                    // is an old data, E.G UDP packets are not delivered in order which means an 
+                    // ALIVE message arrived late even though it was published before a DEAD message
+                    // for this particular node. I might end up removing this, if a node comes back to live
+                    // we will expose an API that allows developer to pass persisted incarnation back to us , next the 
+                    // incarnation and disseminate a join message to the cluster. this will force nodes to accept
+                    // the changes.
+                    self.status.state = other.state();
+                    self.status.last_updated = other.status.last_updated;
+                    changed = true;
                 }
             }
-            Ordering::Greater => Ok(false),
         }
+
+        // Always update network info if changed, regardless of incarnation
+        changed |= self.update_network_info(other);
+
+        if changed {
+            self.log_differences(other);
+        }
+
+        Ok(changed)
+    }
+    // Resolve equal incarnation based on state precedence and update time
+    fn resolve_equal_incarnation(&mut self, other: &Node<M>) -> bool {
+        let mut changed = false;
+
+        if other.status.state.precedence() > self.status.state.precedence() 
+           || (other.status.state == self.status.state && other.status.last_updated > self.status.last_updated)
+           || (self.status.state == NodeState::Dead && other.status.state == NodeState::Alive) {
+            self.status.state = other.status.state;
+            self.status.last_updated = other.status.last_updated;
+            changed = true;
+        }
+
+        changed
     }
 
-    /// Check and log changes
-    fn log_differences(&self, other: &Node<M>) {
+    fn handle_higher_incarnation(&mut self, other: &Node<M>) -> bool {
+        let mut changed = false;
+
+        if self.status != other.status {
+            self.status = other.status.clone();
+            changed = true;
+        }
+
+        changed |= self.update_network_info(other);
+
+        changed
+    }
+
+    fn update_network_info(&mut self, other: &Node<M>) -> bool {
+        let mut changed = false;
+
         if self.ip_addr != other.ip_addr {
-            warn!("IP address changed from {} to {}", self.ip_addr, other.ip_addr);
+            self.ip_addr = other.ip_addr;
+            changed = true;
+        }
+
+        if self.port != other.port {
+            self.port = other.port;
+            changed = true;
+        }
+
+        if self.metadata != other.metadata {
+            self.metadata = other.metadata.clone();
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn log_differences(&self, other: &Node<M>) {
+        if self.status.incarnation != other.status.incarnation {
+            warn!("Incarnation changed for node '{}' from {} to {}", self.name, self.status.incarnation, other.status.incarnation);
+        }
+        if self.status.state != other.status.state {
+            warn!("State changed for node '{}' from {:?} to {:?}", self.name, self.status.state, other.status.state);
+        }
+        if self.ip_addr != other.ip_addr {
+            warn!("IP address changed for node '{}' from {} to {}", self.name, self.ip_addr, other.ip_addr);
         }
         if self.port != other.port {
-            warn!("Port changed from {} to {}", self.port, other.port);
+            warn!("Port changed for node '{}' from {} to {}", self.name, self.port, other.port);
         }
         if self.metadata != other.metadata {
-            warn!("Metadata has changed");
+            warn!("Metadata changed for node '{}'", self.name);
         }
-    }
-
-    fn update_all(&mut self, other: &Node<M>) {
-        self.status = other.status.clone();
-        self.metadata = other.metadata.clone();
-        self.ip_addr = other.ip_addr;
-        self.port = other.port;
     }
 
     /// Checks if the Node has been in the Suspect state for longer than the given timeout.

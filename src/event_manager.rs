@@ -126,34 +126,60 @@ impl EventManager {
         })
     }
 
-    /// Retrieves all events that are due up to the current time.
+    /// Retrieves a limited number of events that are due up to the current time.
     /// Returns a vector of event types and event details.
-    pub(crate) async fn next_events(&self) -> Vec<(EventType, Event)> {
+    pub(crate) async fn next_events(&self, limit: usize) -> Vec<(EventType, Event)> {
         let now = Instant::now();
-        let mut events = self.events.write().await;
-        let mut event_map = self.event_map.write().await;
-        let mut due_events = Vec::new();
+        let mut due_events = Vec::with_capacity(limit);
+        let mut processed = 0;
+
+        loop {
+            // Acquire read lock to check if there's work to do
+            let events = self.events.read().await;
+            if events.is_empty() || events.peek().map_or(true, |(time, _)| *time > now) || processed >= limit {
+                break;
+            }
+            drop(events);
+
+            // Process one event at a time
+            if let Some((event_type, event)) = self.process_next_event().await {
+                due_events.push((event_type, event));
+                processed += 1;
+            } else {
+                break;
+            }
+        }
+
+        due_events
+    }
+
+    async fn process_next_event(&self) -> Option<(EventType, Event)> {
+        let now = Instant::now();
         
-        while let Some((time, _)) = events.peek() {
-            if *time <= now {
-                let id = events.pop().unwrap().1;
+        // Acquire write locks for a short duration
+        let mut events = self.events.write().await;
+        if let Some((time, id)) = events.pop() {
+            if time <= now {
+                drop(events);
+                let mut event_map = self.event_map.write().await;
                 let event_entry = event_map.iter()
                     .find(|(_, (event_id, _))| event_id == &id)
                     .map(|(event_type, _)| event_type.clone());
 
                 if let Some(event_type) = event_entry {
                     if let Some((_, event)) = event_map.remove(&event_type) {
-                        due_events.push((event_type, Event { 
+                        return Some((event_type, Event { 
                             state: EventState::Completed, 
                             sender: event.sender
                         }));
                     }
                 }
             } else {
-                break;
+                // If the event is in the future, put it back
+                events.push((time, id));
             }
         }
-        due_events
+        None
     }
     
     /// Intercepts a specified event, changing its state to Intercepted.

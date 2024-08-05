@@ -21,7 +21,7 @@ pub(crate) const MAX_RETRY_DELAY: u64 = 60; // in secs
 pub(crate) const MAX_CONSECUTIVE_FAILURES: u32 = 2;
 pub(crate) const MAX_UDP_PACKET_SIZE: usize = 1400; 
 pub(crate) const BROADCAST_FANOUT: usize = 2; 
-pub(crate) const INDIRECT_REQ: u32 = 2;
+pub(crate) const INDIRECT_REQ: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct GossipodConfig {
