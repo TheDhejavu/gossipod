@@ -10,7 +10,7 @@ Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Me
 > The codebase may contain bugs or incomplete features.
 > Use with caution. Feedback and contributions welcome, Thanks!.
 
-* [Research Paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
+[RESEARCH PAPER](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
 
 ## Proposed Key Features
 
