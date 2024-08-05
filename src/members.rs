@@ -292,9 +292,6 @@ impl<'a, M: NodeMetadata> Iterator for LeastRecentlyPiggybackedIter<'a, M> {
                         return Ok(Some(node.clone()));
                     }
                 }
-                
-                // Remove this entry as it's either not in nodes or not alive
-                nodes_priority_queue.pop();
             }
             Ok(None)
         }).unwrap_or(None)
