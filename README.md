@@ -76,74 +76,169 @@ sequenceDiagram
     end
 ```
 
-### Usage Sample
 
-```rust
-#[tokio::main]
-async fn main() -> Result<()> {
-    let config = GossipodConfigBuilder::new()
-        .name("node_1")
-        .port(8080)
-        .addr(Ipv4Addr::new(127, 0, 0, 1))
-        .ping_timeout(Duration::from_millis(2000))
-        .build()
-        .await?;
-    
-    let mut gossipod = Gossipod::new(config).await?;
-
-    // Spawn a task to run the Gossipod instance
-    let gossipod_clone1 = gossipod.clone();
-    tokio::spawn(async move {
-        if let Err(e) = gossipod_clone1.start().await {
-            error!("[ERR] Error starting gossipod: {:?}", e);
-        }
-    });
-
-    // wait for Gossipod to start
-    while !gossipod.is_running().await {
-        time::sleep(Duration::from_millis(100)).await;
-    }
-
-    info!("Members: {:?}", gossipod.members().await?);
-    info!("[PROCESS] Gossipod is running");
-
-    // Listen for Ctrl+C or SIGINT
-    let gossipod_clone2 = gossipod.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("Failed to listen for event");
-        info!("Signal received, stopping Gossipod...");
-        gossipod_clone2.stop().await.expect("Failed to stop Gossipod");
-    });
-
-    for _ in 0..10 {
-        if !gossipod.is_running().await {
-            break;
-        }
-        time::sleep(Duration::from_secs(1)).await;
-    }
-
-    // Await until Gossipod is stopped either by signal or loop completion
-    while gossipod.is_running().await {
-        time::sleep(Duration::from_millis(100)).await;
-    }o
-
-    info!("[PROCESS] Gossipod has been stopped");
-    Ok(())
-}
-```
 ### Quick Demo
 To see Gossipod in action, check out the `./examples` directory, which
 includes a number of demos. Below you can run two different instances of gossipod specifiying different port address and node name
 
 #### Node 1
 ```sh
-> cargo run  --example default_gossipod -- --name=node_1 --port=8080
+> cargo run --example ping_node -- --name=NODE_1 --port=7948 
 ```
 
 #### Node 2 with initial join
 ```sh
-> cargo run  --example default_gossipod -- --name=node_2  --port=7070 --join-addr=127.0.0.1:8080
+> cargo run --example pong_node -- --name=NODE_2 --port=7947 --join-addr=127.0.0.1:7948
 ```
+
+# Gossipod API
+
+### Creating a new Gossipod instance
+
+```rust
+let config = GossipodConfigBuilder::new()
+    .name(node_name)
+    .port(port)
+    .addr(ip_address)
+    .ping_timeout(Duration::from_millis(2000))
+    .build()
+    .await?;
+
+let gossipod = Gossipod::new(config).await?;
+```
+
+#### With custom node metadata
+
+```rust
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct Metadata {
+    region: String,
+    datacenter: String,
+}
+
+impl NodeMetadata for Metadata {}
+
+let metadata = Metadata { 
+        region: "aws-west-1".to_string(),
+        datacenter: "dc1".to_string(),
+    };
+
+let gossipod = Gossipod::with_metadata(config, metadata)
+        .await
+        .context("Failed to initialize Gossipod with custom metadata")?;
+```
+
+
+### Starting Gossipod
+
+```rust
+gossipod.start().await
+```
+
+Starts the Gossipod service. This should be run in a separate task.
+
+### Checking if Gossipod is running
+
+```rust
+gossipod.is_running().await
+```
+
+Returns a boolean indicating whether the Gossipod service is currently running.
+
+### Stopping Gossipod
+
+```rust
+gossipod.stop().await
+```
+
+Stops the Gossipod service.
+
+### Getting the local node information
+
+```rust
+gossipod.get_local_node().await
+```
+
+Returns information about the local node.
+
+## Communication
+
+### Setting up a receiver
+
+```rust
+let receiver = gossipod.with_receiver(channel_size).await
+```
+
+Sets up a channel to receive incoming messages.
+
+### Sending a message
+
+```rust
+gossipod.send(target_socket_addr, &serialized_message).await
+```
+
+Sends a message to a specific target node.
+
+## Membership
+
+### Getting the list of members
+
+```rust
+gossipod.members().await
+```
+
+Returns a list of all `alive` members in the cluster.
+
+## Configuration
+
+The `GossipodConfigBuilder` allows you to configure various aspects of the Gossipod instance:
+
+- `name(String)`: Sets the name of the node
+- `port(u16)`: Sets the port to bind to
+- `addr(Ipv4Addr)`: Sets the IP address to bind to
+- `ping_timeout(Duration)`: Sets the timeout for ping operations
+
+## Example Usage
+
+Here's a basic example of how to use Gossipod in your application:
+
+```rust
+let config = GossipodConfigBuilder::new()
+    .name("NODE_1")
+    .port(7948)
+    .addr("127.0.0.1".parse()?)
+    .ping_timeout(Duration::from_millis(2000))
+    .build()
+    .await?;
+
+let gossipod = Arc::new(Gossipod::new(config.clone()).await?);
+
+// Start Gossipod
+tokio::spawn(gossipod.clone().start());
+
+// Wait for Gossipod to start
+while !gossipod.is_running().await {
+    time::sleep(Duration::from_millis(100)).await;
+}
+
+// Set up a receiver
+let mut msg_ch = gossipod.with_receiver(100).await;
+
+// Main loop
+loop {
+    tokio::select! {
+        Some(data) = msg_ch.recv() => {
+            // Handle incoming message
+        }
+        _ = tokio::signal::ctrl_c() => {
+            gossipod.stop().await?;
+            break;
+        }
+    }
+}
+```
+
 
 ## Reference
 - SWIM: Scalable Weakly-consistent Infection-style Process Group Membership
