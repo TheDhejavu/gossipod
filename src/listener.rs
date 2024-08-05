@@ -104,7 +104,7 @@ impl<M: NodeMetadata> EventListener<M> {
     /// to the appropriate methods in the Gossipod instance.
     async fn process_tcp_stream(gossipod: Gossipod<M>, stream: TcpStream, message: Message, addr: SocketAddr) -> Result<()> {
         match message.msg_type {
-            MessageType::AppMsg => gossipod.handle_app_msg(message).await,
+            MessageType::AppMsg => gossipod.handle_app_msg(message.payload).await,
             _ => {
                 warn!("[ERR] Unexpected message type {} for TCP from {}", message.msg_type, addr);
                 Ok(())
@@ -119,7 +119,6 @@ impl<M: NodeMetadata> EventListener<M> {
             MessageType::PingReq => gossipod.handle_ping_req(message.sender, message.payload).await,
             MessageType::Ack => gossipod.handle_ack(message.payload).await,
             MessageType::Broadcast => gossipod.handle_broadcast(message).await,
-            MessageType::AppMsg => gossipod.handle_app_msg(message).await,
             _ => {
                 warn!("[ERR] Unexpected message type {} for UDP from {}", message.msg_type, addr);
                 Ok(())

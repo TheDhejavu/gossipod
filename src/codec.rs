@@ -28,7 +28,7 @@ impl MessageCodec {
     /// source buffer. It's useful for reading fixed-size fields in the protocol.
     pub(crate) fn read_bytes(src: &mut BytesMut, size: usize) -> Result<BytesMut> {
         if src.remaining() < size {
-            return Err(anyhow!("buffer underflow: not enough data"));
+            return Err(anyhow!("Insufficient bytes in buffer to read byte"));
         }
         Ok(src.split_to(size))
     }
@@ -430,17 +430,17 @@ impl MessageCodec {
     /// Decodes a MessagePayload from BytesMut.
     ///
     /// This method deserializes a MessagePayload enum from the BytesMut buffer.
-    fn decode_message_payload(msg_type: MessageType, src: &mut BytesMut) -> Result<MessagePayload> {
+    pub fn decode_message_payload(msg_type: MessageType, src: &mut BytesMut) -> Result<MessagePayload> {
         let len = Self::read_bytes(src, 4)?.get_u32() as usize;
         let mut payload_data = Self::read_bytes(src, len)?;
-
+        
         match msg_type {
             MessageType::Ping => Ok(MessagePayload::Ping(Self::decode_ping_payload(&mut payload_data)?)),
             MessageType::PingReq => Ok(MessagePayload::PingReq(Self::decode_ping_req_payload(&mut payload_data)?)),
             MessageType::Ack => Ok(MessagePayload::Ack(Self::decode_ack_payload(&mut payload_data)?)),
             MessageType::NoAck => Ok(MessagePayload::NoAck(Self::decode_no_ack_payload(&mut payload_data)?)),
             MessageType::SyncReq => Ok(MessagePayload::SyncReq(Self::decode_sync_req_payload(&mut payload_data)?)),
-            MessageType::AppMsg => Ok(MessagePayload::AppMsg(Self::decode_app_msg_payload(src)?)),
+            MessageType::AppMsg => Ok(MessagePayload::AppMsg(Self::decode_app_msg_payload(&mut payload_data)?)),
             MessageType::Broadcast => Ok(MessagePayload::Broadcast(Self::decode_broadcast(&mut payload_data)?)),
         }
     }
@@ -477,6 +477,7 @@ impl Decoder for MessageCodec {
         
         let message_type = MessageType::from_u8(Self::decode_u8(src)?)?;
         let sender = Self::decode_socket_addr(src)?;
+        println!("{:?} {:?}", message_type, sender);
         let payload: MessagePayload =  Self::decode_message_payload(message_type, src)?;
 
         Ok(Some(Message {

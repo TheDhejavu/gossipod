@@ -529,6 +529,10 @@ impl<M: NodeMetadata> Gossipod<M> {
 
     // Send user application-specific messages to target
     pub async fn send(&self, target: SocketAddr, msg: &[u8]) -> Result<()> {
+        let local_node = self.get_local_node().await?;
+        let local_addr = local_node.socket_addr()?;
+
+        self.inner.net_svc.message_target(target, local_addr, msg).await?;
         Ok(())
     }
 
@@ -913,8 +917,19 @@ impl<M: NodeMetadata> Gossipod<M> {
        Ok(())
     }
      
-    async fn handle_app_msg(&self, message: Message) -> Result<()> {
-        unimplemented!()
+    async fn handle_app_msg(&self, message_payload: MessagePayload) -> Result<()> {
+        match message_payload {
+            MessagePayload::AppMsg(payload) => {
+                if !self.inner.notifier.is_initialized().await {
+                    warn!("New message but no receiver is set, ignoring app message.");
+                    return Ok(());
+                }
+
+                self.inner.notifier.notify(payload.data).await?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Processes incoming broadcast messages.
@@ -1458,8 +1473,8 @@ impl<M: NodeMetadata> Gossipod<M> {
         Err(anyhow!("local node is not set"))
     }
 
-    pub async fn members(&self)-> Result<Vec<Node<M>>>  {
-        self.inner.members.get_all_nodes()
+    pub async fn members(&self)-> Result<Vec<Node<M>>>  { 
+        self.inner.members.get_nodes(Some(|n: &Node<M>| !n.is_alive()))
     }
     
     pub async fn stop(&self) -> Result<()> {

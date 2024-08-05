@@ -255,4 +255,20 @@ impl NetSvc {
 
         self.transport.write_to_udp(target,&buffer).await
     }
+
+    pub async fn message_target(&self,  target: SocketAddr, sender: SocketAddr, data: &[u8]) -> Result<()> {
+        let message_payload = AppMsgPayload {data: data.to_vec()};
+        let message = Message {
+            msg_type: MessageType::AppMsg,
+            payload: MessagePayload::AppMsg(message_payload),
+            sender,
+        };
+
+        let mut codec = MessageCodec::new();
+        let mut buffer = BytesMut::new();
+        codec.encode(message, &mut buffer)?;
+
+        let mut stream = self.transport.dial_tcp(target).await?;
+        self.transport.write_to_tcp(&mut stream, &buffer).await
+    }
 }
