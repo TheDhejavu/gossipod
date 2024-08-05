@@ -1,6 +1,7 @@
 # Gossipod
 
 [![CICD](https://github.com/thedhejavu/gossipod/actions/workflows/CI.yml/badge.svg)](https://github.com/TheDhejavu/gossipod/actions/workflows/CI.yml)
+![minimum rustc 1.81](https://img.shields.io/badge/rustc-1.81.0+-red.svg)
 
 An Asynchronous SWIM protocol implementation written in Rust, providing out-of-the-box and extendable transport-layer communication via TCP and UDP based-off [SWIM Protocol Paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
 
@@ -118,7 +119,6 @@ async fn main() -> Result<()> {
         if !gossipod.is_running().await {
             break;
         }
-        gossipod.send_message().await?;
         time::sleep(Duration::from_secs(1)).await;
     }
 
@@ -130,6 +130,19 @@ async fn main() -> Result<()> {
     info!("[PROCESS] Gossipod has been stopped");
     Ok(())
 }
+```
+### Quick Demo
+To see Gossipod in action, check out the `./examples` directory, which
+includes a number of demos. Below you can run two different instances of gossipod specifiying different port address and node name
+
+#### Node 1
+```sh
+> cargo run  --example default_gossipod -- --name=node_1 --port=8080
+```
+
+#### Node 2 with initial join
+```sh
+> cargo run  --example default_gossipod -- --name=node_2  --port=7070 --join-addr=127.0.0.1:8080
 ```
 
 ## Reference

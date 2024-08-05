@@ -44,7 +44,7 @@ mod event_manager;
 mod notifer;
 mod utils;
 
-//  # SWIM Protocol Implementation for GOSSIPOD
+// SWIM Protocol Implementation for GOSSIPOD
 
 /// This module implements an asynchronous SWIM (Scalable Weakly-consistent
 /// Infection-style Membership) protocol. The implementation is modularized
@@ -142,7 +142,6 @@ pub(crate) struct InnerGossipod<M: NodeMetadata>  {
     /// Counter for synchronization requests
     sync_req: AtomicU64,
     notifier: Arc<Notifier>,
-    last_probed_times: RwLock<HashMap<String, SystemTime>>,
 
     /// Network service for handling communication
     pub(crate) net_svc: NetSvc,
@@ -194,7 +193,6 @@ impl<M: NodeMetadata> Gossipod<M> {
                 incarnation: AtomicU64::new(0),
                 sync_req: AtomicU64::new(0),
                 notifier: Arc::new(Notifier::new()),
-                last_probed_times: RwLock::new(HashMap::new()),
                 event_manager: EventManager::new(),
             })
         };
@@ -735,16 +733,6 @@ impl<M: NodeMetadata> Gossipod<M> {
         MessageCodec::encode_bytes(&payload_bytes, &mut message_bytes)?;
 
         Ok(message_bytes)
-    }
-
-    async fn update_last_probed_time(&self, node_name: &str) -> Result<()> {
-        let mut probe_times = self.inner.last_probed_times.write().await;
-        probe_times.insert(node_name.to_string(), SystemTime::now());
-        Ok(())
-    }
-
-    async fn get_last_probed_time(&self, node_name: &str) -> Option<SystemTime> {
-        self.inner.last_probed_times.read().await.get(node_name).cloned()
     }
 
     /// Gossipod GOSSIP - Gossip with randomly selected nodes for state changes
