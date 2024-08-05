@@ -477,7 +477,6 @@ impl Decoder for MessageCodec {
         
         let message_type = MessageType::from_u8(Self::decode_u8(src)?)?;
         let sender = Self::decode_socket_addr(src)?;
-        println!("{:?} {:?}", message_type, sender);
         let payload: MessagePayload =  Self::decode_message_payload(message_type, src)?;
 
         Ok(Some(Message {
