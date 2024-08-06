@@ -2,6 +2,7 @@
 
 [![CICD](https://github.com/thedhejavu/gossipod/actions/workflows/CI.yml/badge.svg)](https://github.com/TheDhejavu/gossipod/actions/workflows/CI.yml)
 ![minimum rustc 1.81](https://img.shields.io/badge/rustc-1.81.0+-red.svg)
+![GitHub](https://img.shields.io/github/license/thedhejavu/gossipod)
 
 Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Membership Protocol) implementation written in Rust.
 
