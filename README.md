@@ -98,10 +98,14 @@ includes a number of demos. Below you can run two different instances of gossipo
 
 ```rust
 let config = GossipodConfigBuilder::new()
-    .name(node_name)
-    .port(port)
-    .addr(ip_address)
-    .ping_timeout(Duration::from_millis(2000))
+    .name(&args.name)
+    .port(args.port)
+    .addr(args.ip.parse::<Ipv4Addr>().expect("Invalid IP address"))
+    .probing_interval(Duration::from_secs(1))
+    .ack_timeout(Duration::from_millis(500))
+    .indirect_ack_timeout(Duration::from_secs(1))
+    .suspicious_timeout(Duration::from_secs(5))
+    .network_type(NetworkType::LAN)
     .build()
     .await?;
 
