@@ -9,11 +9,27 @@ use anyhow::{Result, Context, anyhow};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use parking_lot::RwLock;
+use async_trait::async_trait;
 use crate::config::{DEFAULT_CHANNEL_BUFFER_SIZE, DEFAULT_MESSAGE_BUFFER_SIZE, MAX_UDP_PACKET_SIZE};
 use crate::message::Message;
 
-type NetworkTcpStream = (SocketAddr, TcpStream);
-type NetworkUdpSocket = (SocketAddr, Vec<u8>);
+pub(crate) type NetworkTcpStream = (SocketAddr, TcpStream);
+pub(crate) type NetworkUdpSocket = (SocketAddr, Vec<u8>);
+
+#[async_trait]
+pub trait NodeTransport: Send + Sync {
+    fn port(&self) -> u16;
+    fn ip_addr(&self) -> IpAddr;
+    async fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpStream>;
+    async fn write_to_tcp(&self, stream: &mut TcpStream, message: &[u8]) -> Result<()>;
+    async fn write_to_udp(&self, addr: SocketAddr, message: &[u8]) -> Result<()>;
+    async fn tcp_stream_listener(&self) -> Result<()>;
+    async fn udp_socket_listener(&self) -> Result<()>;
+    async fn bind_tcp_listener(&self) -> Result<()>;
+    async fn bind_udp_socket(&self) -> Result<()>;
+    fn tcp_stream_tx(&self) -> mpsc::Sender<NetworkTcpStream>;
+    fn udp_socket_tx(&self) -> mpsc::Sender<NetworkUdpSocket>;
+}
 
 /// Transport is responsible for sending messages to peers
 #[derive(Clone)]
@@ -31,20 +47,66 @@ pub(crate) struct Transport {
     pub(crate) udp_socket_tx: mpsc::Sender<NetworkUdpSocket>,
 }
 
-pub(crate) struct TransportChannel {
-    pub(crate) tcp_stream_rx: mpsc::Receiver<NetworkTcpStream>,
-    pub(crate) udp_socket_rx: mpsc::Receiver<NetworkUdpSocket>,
+
+pub struct TransportChannel {
+    pub tcp_stream_rx: mpsc::Receiver<NetworkTcpStream>,
+    pub udp_socket_rx: mpsc::Receiver<NetworkUdpSocket>,
 }
 
-#[async_trait::async_trait]
-pub(crate) trait NodeTransport: Send + Sync  {
-    async fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpStream>;
-    async fn write_to_tcp(&self, stream: &mut TcpStream, message: &[u8]) -> Result<()>;
-    async fn write_to_udp(&self, addr: SocketAddr, message: &[u8]) -> Result<()>;
+impl Transport {
+    /// Creates a new Transport instance and its associated TransportChannel
+    pub fn new(port: u16, ip_addr: IpAddr, dial_timeout: Duration) -> (Self, TransportChannel) {
+        let (tcp_stream_tx, tcp_stream_rx) = mpsc::channel(DEFAULT_CHANNEL_BUFFER_SIZE); 
+        let (udp_socket_tx, udp_socket_rx) = mpsc::channel(DEFAULT_CHANNEL_BUFFER_SIZE); 
+
+        (
+            Self {
+                port,
+                ip_addr,
+                tcp_listener: Arc::new(RwLock::new(None)),
+                udp_socket: Arc::new(RwLock::new(None)),
+                dial_timeout,
+                tcp_stream_tx,
+                udp_socket_tx
+            }, 
+            TransportChannel {
+                tcp_stream_rx,
+                udp_socket_rx
+            }
+        )
+    }
+
+    /// Reads a message from a TCP stream
+    pub(crate) async fn read_stream(stream: &mut TcpStream) -> Result<Message> {
+        let mut buffer = vec![0u8; DEFAULT_MESSAGE_BUFFER_SIZE];
+        match stream.read(&mut buffer).await {
+            Ok(n) => {
+                buffer.truncate(n);
+                Message::from_vec(&buffer).context("Failed to decode message")
+            }
+            Err(e) => {
+                warn!("Failed to read from TCP stream: {:?}", e);
+                Err(anyhow!("Stream read error: {}", e))
+            }
+        }
+    }
+
+    /// Reads a message from a UDP socket
+    pub(crate)  async fn read_socket(buffer: Vec<u8>) -> Result<Message> {
+        Message::from_vec(&buffer).context("Failed to decode message")
+    }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl NodeTransport for Transport {
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn ip_addr(&self) -> IpAddr {
+        self.ip_addr
+    }
+
     /// Establishes a TCP connection to the specified address
     async fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpStream> {
         timeout(self.dial_timeout, TcpStream::connect(addr))
@@ -77,33 +139,9 @@ impl NodeTransport for Transport {
             .map(|_| ())
             .context("Failed to send UDP message")
     }
-}
-
-impl Transport {
-    /// Creates a new Transport instance and its associated TransportChannel
-    pub(crate) fn new(port: u16, ip_addr: IpAddr, dial_timeout: Duration) -> (Self, TransportChannel) {
-        let (tcp_stream_tx, tcp_stream_rx) = mpsc::channel(DEFAULT_CHANNEL_BUFFER_SIZE); 
-        let (udp_socket_tx, udp_socket_rx) = mpsc::channel(DEFAULT_CHANNEL_BUFFER_SIZE); 
-
-        (
-            Self {
-                port,
-                ip_addr,
-                tcp_listener: Arc::new(RwLock::new(None)),
-                udp_socket: Arc::new(RwLock::new(None)),
-                dial_timeout,
-                tcp_stream_tx,
-                udp_socket_tx
-            }, 
-            TransportChannel {
-                tcp_stream_rx,
-                udp_socket_rx
-            }
-        )
-    } 
 
     /// Listens for incoming TCP connections
-    pub(crate) async fn tcp_stream_listener(&self) -> Result<()> {
+    async fn tcp_stream_listener(&self) -> Result<()> {
         let listener = self.tcp_listener.read().as_ref()
             .ok_or_else(|| anyhow!("TCP listener not initialized"))?
             .clone();
@@ -123,7 +161,7 @@ impl Transport {
     }
 
     /// Listens for incoming UDP messages
-    pub(crate) async fn udp_socket_listener(&self) -> Result<()> {
+    async fn udp_socket_listener(&self) -> Result<()> {
         let socket = self.udp_socket.read().as_ref()
             .ok_or_else(|| anyhow!("UDP socket not initialized"))?
             .clone();
@@ -144,7 +182,7 @@ impl Transport {
     }
 
     /// Binds the TCP listener to the configured address and port
-    pub(crate) async fn bind_tcp_listener(&self) -> Result<()> {
+    async fn bind_tcp_listener(&self) -> Result<()> {
         let bind_addr = SocketAddr::new(self.ip_addr, self.port);
         let listener = TokioTcpListener::bind(bind_addr).await?;
         *self.tcp_listener.write() = Some(Arc::new(listener));
@@ -152,30 +190,18 @@ impl Transport {
     }
 
     /// Binds the UDP socket to the configured address and port
-    pub(crate) async fn bind_udp_socket(&self) -> Result<()> {
+    async fn bind_udp_socket(&self) -> Result<()> {
         let bind_addr = SocketAddr::new(self.ip_addr, self.port);
         let socket = TokioUdpSocket::bind(bind_addr).await?;
         *self.udp_socket.write() = Some(Arc::new(socket));
         Ok(())
     }
 
-    /// Reads a message from a TCP stream
-    pub(crate) async fn read_stream(stream: &mut TcpStream) -> Result<Message> {
-        let mut buffer = vec![0u8; DEFAULT_MESSAGE_BUFFER_SIZE];
-        match stream.read(&mut buffer).await {
-            Ok(n) => {
-                buffer.truncate(n);
-                Message::from_vec(&buffer).context("Failed to decode message")
-            }
-            Err(e) => {
-                warn!("Failed to read from TCP stream: {:?}", e);
-                Err(anyhow!("Stream read error: {}", e))
-            }
-        }
+    fn tcp_stream_tx(&self) -> mpsc::Sender<NetworkTcpStream> {
+        self.tcp_stream_tx.clone()
     }
 
-    /// Reads a message from a UDP socket
-    pub(crate) async fn read_socket(buffer: Vec<u8>) -> Result<Message> {
-        Message::from_vec(&buffer).context("Failed to decode message")
+    fn udp_socket_tx(&self) -> mpsc::Sender<NetworkUdpSocket> {
+        self.udp_socket_tx.clone()
     }
 }

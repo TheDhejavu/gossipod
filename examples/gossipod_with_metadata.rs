@@ -1,6 +1,6 @@
 use std::{net::{Ipv4Addr, SocketAddr}, time::Duration};
 use anyhow::{Context as _, Result};
-use gossipod::{config::GossipodConfigBuilder, Gossipod, NodeMetadata};
+use gossipod::{config::{GossipodConfigBuilder, NetworkType}, Gossipod, NodeMetadata};
 use log::*;
 use serde::{Deserialize, Serialize};
 use tokio::time;
@@ -38,7 +38,11 @@ async fn main() -> Result<()> {
         .name(&args.name)
         .port(args.port)
         .addr(args.ip.parse::<Ipv4Addr>().expect("Invalid IP address"))
-        .ping_timeout(Duration::from_millis(2000))
+        .probing_interval(Duration::from_secs(1))
+        .ack_timeout(Duration::from_millis(500))
+        .indirect_ack_timeout(Duration::from_secs(1))
+        .suspicious_timeout(Duration::from_secs(5))
+        .network_type(NetworkType::LAN)
         .build()
         .await?;
 

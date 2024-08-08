@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_util::{bytes::BytesMut, codec::{Decoder, Encoder}};
 use core::fmt;
-use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
+use std::{net::SocketAddr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
 use crate::{codec::MessageCodec, node::{Node, NodeMetadata}, transport::{NodeTransport, Transport}, NodeState};
 
@@ -183,12 +183,12 @@ impl fmt::Display for MessageType {
 }
 
 pub(crate) struct NetSvc {
-    pub(crate) transport: Box<dyn NodeTransport>,
+    pub(crate) transport: Arc<dyn NodeTransport>,
 }
 
 impl NetSvc {
     /// Creates a new MessageBroker instance
-    pub fn new(transport: Box<dyn NodeTransport>) -> Self {
+    pub fn new(transport: Arc<dyn NodeTransport>) -> Self {
         Self { transport }
     }
 

@@ -102,7 +102,7 @@ impl<M: NodeMetadata> Membership<M> {
         F: Fn(&Node<M>) -> bool,
     {
         let mut active_nodes: Vec<_> = self.nodes.iter()
-            .filter(|r| r.value().is_alive() && exclude.as_ref().map_or(true, |f| !f(r.value())))
+            .filter(|r| exclude.as_ref().map_or(true, |f| !f(r.value())))
             .map(|r| r.value().clone())
             .collect();
         
@@ -121,7 +121,7 @@ impl<M: NodeMetadata> Membership<M> {
         F: Fn(&Node<M>) -> bool,
     {
         let eligible_nodes: Vec<_> = self.nodes.iter()
-            .filter(|r| r.value().is_alive() && exclude.as_ref().map_or(true, |f| !f(r.value())))
+            .filter(|r| exclude.as_ref().map_or(true, |f| !f(r.value())))
             .map(|r| r.value().clone())
             .collect();
 
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn test_merge_add_node() {
         let membership = Membership::new();
-        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0, DefaultMetadata::new());
+        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0, DefaultMetadata::default());
         node.update_state(NodeState::Alive).expect("unable to update node state");
 
         let result = membership.merge(&node).unwrap();
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn test_merge_ignore_leaving_node() {
         let membership = Membership::new();
-        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0, DefaultMetadata::new());
+        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0, DefaultMetadata::default());
         node.update_state(NodeState::Leaving).expect("unable to update node state");
 
         let result = membership.merge(&node).unwrap();
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn test_merge_remove_leaving_node() {
         let membership = Membership::new();
-        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0, DefaultMetadata::new());
+        let mut node = Node::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000, "node1".to_string(), 0, DefaultMetadata::default());
         node.update_state(NodeState::Alive).expect("unable to update node state");
         membership.add_node(node.clone()).expect("unable to add node");
 

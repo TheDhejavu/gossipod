@@ -22,7 +22,7 @@ Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Me
 - Codec-based message serialization and deserialization for efficient network communication
 - Configurable failure detection parameters
 - Inbuilt Support for both TCP and UDP protocols 
-- Robust and Configurable Observability (Logging and Metrics)
+- Configurable Observability (Logging and Metrics)
 - Basic encryption of data packets for secure communication
 - Extensible design allowing for future custom behaviors 
 - Implement `(SWIM:Basic)` + `(SWIM+Inf.)` + `(SWIM+Inf.+Susp.)` and extend to include features from [Lifeguard](https://arxiv.org/pdf/1707.00788) by Hashicorp Research
@@ -32,9 +32,7 @@ Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Me
 
 Gossipod employs 3 types of messages: `PING`, `PING-REQ`, and `ANNOUNCE` (which includes `JOIN`, `LEAVE`, `SUSPECT`, `ALIVE`, and `CONFIRM` subtypes). The `PING` and `PING-REQ` messages are central to the system's failure detection mechanism base-off SWIM, facilitating constant state exchange by piggybacking information dissemination on this process. When a state change occurs, either through voluntary requests or regular failure detection, the system uses `BROADCAST` messages for random dissemination of this information. Each node in the network maintains an incarnation number, starting at zero, which can only be incremented by the node itself. This number is crucial for managing the node's state in other nodes' local membership lists and serves as a means to refute suspicions `(SWIM+Inf.+Susp.)` from other nodes. This design allows Gossipod to achieve efficient and resilient distributed state management and failure detection in a distributed or decentralized network, balancing the needs for up-to-date information, conflict resolution, and system reliability.
 
-By Extension, [Lifeguard](https://arxiv.org/pdf/1707.00788) offers additional implementation features that are not yet incorporated into the current version of Gossipod. I plan to integrate these features in a future release i like the idea of constantly pushing and pulling of state at interval to randomly selected `k` nodes. 
-
-During my experiments with the [Hashicorp memberlist](https://github.com/hashicorp/memberlist), I observed that this approach seems to promote faster membership convergence compared to relying solely on the standard piggybacked method for information dissemination. The regular intervals of state exchange appear to accelerate the process of achieving state convergence across the network.
+By Extension, [Lifeguard](https://arxiv.org/pdf/1707.00788) offers additional implementation features that are not yet incorporated into the current version of Gossipod which are fully supported by [Hashicorp memberlist](https://github.com/hashicorp/memberlist). I plan to integrate these features in a future release.
 
 
 ### Diagram
@@ -137,10 +135,14 @@ Here's a basic example of how to use Gossipod in your application:
 ```rust
 // Configuration
 let config = GossipodConfigBuilder::new()
-    .name("NODE_1")
-    .port(7948)
-    .addr("127.0.0.1".parse()?)
-    .ping_timeout(Duration::from_millis(2000))
+    .name(&args.name)
+    .port(args.port)
+    .addr(args.ip.parse::<Ipv4Addr>().expect("Invalid IP address"))
+    .probing_interval(Duration::from_secs(1))
+    .ack_timeout(Duration::from_millis(500))
+    .indirect_ack_timeout(Duration::from_secs(1))
+    .suspicious_timeout(Duration::from_secs(5))
+    .network_type(NetworkType::LAN)
     .build()
     .await?;
 

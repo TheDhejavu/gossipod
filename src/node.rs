@@ -40,10 +40,10 @@ pub struct NodeStatus {
 
 impl NodeStatus {
     /// Creates a new `NodeStatus` with default values.
-    fn new(incarnation: u64) -> Self {
+    fn new(state: NodeState, incarnation: u64) -> Self {
         Self {
             incarnation,
-            state: NodeState::Unknown,
+            state,
             last_updated: 0,
         }
     }
@@ -84,7 +84,7 @@ pub struct DefaultMetadata {
 impl NodeMetadata for DefaultMetadata {}
 
 impl DefaultMetadata {
-    pub fn new() -> Self {
+    pub fn default() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
 
@@ -228,15 +228,20 @@ impl<M: NodeMetadata> Node<M> {
             ip_addr,
             port,
             name,
-            status: NodeStatus::new(incarnation),
+            status: NodeStatus::new(NodeState::Unknown,incarnation),
             metadata: metadata,
         }
     }
 
-    /// Returns the `SocketAddr` for this Node.
-    pub fn with_state(&mut self, new_state: NodeState) -> Self {
-        self.status.state = new_state;
-        self.clone()
+    /// Creates a new node with state
+    pub fn with_state(state: NodeState, ip_addr: IpAddr, port: u16, name: String, incarnation: u64, metadata: M ) -> Self {
+        Self {
+            ip_addr,
+            port,
+            name,
+            status: NodeStatus::new(state,incarnation),
+            metadata,
+        }
     }
 
     /// Returns the `SocketAddr` for this Node.
@@ -274,7 +279,7 @@ impl<M: NodeMetadata> Node<M> {
         self.status.state = self.status.state.next_state();
     }
 
-     /// Advances the Node to the next state.
+    /// Sets the current node incarnation number
     pub(crate) fn set_incarnation(&mut self, incarnation: u64) {
         self.status.incarnation = incarnation;
     }
@@ -416,20 +421,6 @@ impl<M: NodeMetadata> Node<M> {
         }
     }
 
-    /// Checks if the Node has been in the Suspect state for longer than the given timeout.
-    pub fn suspect_timeout(&self, timeout: Duration) -> Result<bool> {
-        if self.status.state != NodeState::Suspect {
-            return Ok(false);
-        }
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-
-        let time_in_suspect_state = now.saturating_sub(self.status.last_updated.try_into()?);
-        
-        Ok(time_in_suspect_state > timeout.as_secs())
-    }
 }
 
 impl<M> PartialOrd for Node<M>

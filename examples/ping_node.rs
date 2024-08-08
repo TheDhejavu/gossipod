@@ -2,7 +2,8 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
-use gossipod::{config::GossipodConfigBuilder, Gossipod};
+
+use gossipod::{config::{GossipodConfigBuilder, NetworkType}, Gossipod};
 use log::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
@@ -31,7 +32,11 @@ impl SwimNode {
             .name(&args.name)
             .port(args.port)
             .addr(args.ip.parse::<Ipv4Addr>().expect("Invalid IP address"))
-            .ping_timeout(Duration::from_millis(2000))
+            .probing_interval(Duration::from_secs(5))
+            .ack_timeout(Duration::from_millis(500))
+            .indirect_ack_timeout(Duration::from_secs(1))
+            .suspicious_timeout(Duration::from_secs(5))
+            .network_type(NetworkType::Local)
             .build()
             .await?;
 

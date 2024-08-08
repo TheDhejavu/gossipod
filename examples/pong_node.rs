@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
-use gossipod::{config::GossipodConfigBuilder, Gossipod};
+use gossipod::{config::{GossipodConfigBuilder, NetworkType}, Gossipod};
 use log::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
@@ -36,7 +36,7 @@ struct Message {
 
 struct SwimNode {
     gossipod: Arc<Gossipod>,
-    msg_ch: mpsc::Receiver<Vec<u8>>,
+    receiver: mpsc::Receiver<Vec<u8>>,
     config: gossipod::config::GossipodConfig,
 }
 
@@ -46,7 +46,11 @@ impl SwimNode {
             .name(&args.name)
             .port(args.port)
             .addr(args.ip.parse::<Ipv4Addr>().expect("Invalid IP address"))
-            .ping_timeout(Duration::from_millis(2000))
+            .probing_interval(Duration::from_secs(5))
+            .ack_timeout(Duration::from_millis(3_000))
+            .indirect_ack_timeout(Duration::from_secs(1))
+            .suspicious_timeout(Duration::from_secs(5))
+            .network_type(NetworkType::Local)
             .build()
             .await?;
 
@@ -54,11 +58,11 @@ impl SwimNode {
             .await
             .context("Failed to initialize Gossipod")?);
 
-        let msg_ch = gossipod.with_receiver(100).await;
+        let receiver = gossipod.with_receiver(100).await;
 
         Ok(SwimNode {
             gossipod,
-            msg_ch,
+            receiver,
             config,
         })
     }
@@ -84,7 +88,7 @@ impl SwimNode {
     async fn run(&mut self) -> Result<()> {
         loop {
             tokio::select! {
-                Some(msg) = self.msg_ch.recv() => {
+                Some(msg) = self.receiver.recv() => {
                     self.handle_incoming_message(msg).await?;
                 }
                 _ = tokio::signal::ctrl_c() => {
