@@ -10,15 +10,18 @@ use std::cmp::Ordering;
 use std::any::type_name;
 use crate::state::NodeState;
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub(crate) struct NodePriority<M: NodeMetadata> {
-    pub(crate) last_probed: SystemTime,
-    pub(crate) node: Node<M>,
+    pub(crate) last_piggybacked: SystemTime,
+    pub(crate) name: String,
+    pub(crate) _marker: std::marker::PhantomData<M>,
 }
 
 impl<M: NodeMetadata> Ord for NodePriority<M> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.last_probed.cmp(&self.last_probed)
+        // TODO: Potential Improvement:
+        // - Combine least-recently-piggybacked with priority for recent state changes.
+        other.last_piggybacked.cmp(&self.last_piggybacked)
     }
 }
 
@@ -37,10 +40,10 @@ pub struct NodeStatus {
 
 impl NodeStatus {
     /// Creates a new `NodeStatus` with default values.
-    fn new(incarnation: u64) -> Self {
+    fn new(state: NodeState, incarnation: u64) -> Self {
         Self {
             incarnation,
-            state: NodeState::Unknown,
+            state,
             last_updated: 0,
         }
     }
@@ -81,7 +84,7 @@ pub struct DefaultMetadata {
 impl NodeMetadata for DefaultMetadata {}
 
 impl DefaultMetadata {
-    pub fn new() -> Self {
+    pub fn default() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
 
@@ -225,15 +228,20 @@ impl<M: NodeMetadata> Node<M> {
             ip_addr,
             port,
             name,
-            status: NodeStatus::new(incarnation),
+            status: NodeStatus::new(NodeState::Unknown,incarnation),
             metadata: metadata,
         }
     }
 
-    /// Returns the `SocketAddr` for this Node.
-    pub fn with_state(&mut self, new_state: NodeState) -> Self {
-        self.status.state = new_state;
-        self.clone()
+    /// Creates a new node with state
+    pub fn with_state(state: NodeState, ip_addr: IpAddr, port: u16, name: String, incarnation: u64, metadata: M ) -> Self {
+        Self {
+            ip_addr,
+            port,
+            name,
+            status: NodeStatus::new(state,incarnation),
+            metadata,
+        }
     }
 
     /// Returns the `SocketAddr` for this Node.
@@ -271,7 +279,7 @@ impl<M: NodeMetadata> Node<M> {
         self.status.state = self.status.state.next_state();
     }
 
-     /// Advances the Node to the next state.
+    /// Sets the current node incarnation number
     pub(crate) fn set_incarnation(&mut self, incarnation: u64) {
         self.status.incarnation = incarnation;
     }
@@ -296,65 +304,123 @@ impl<M: NodeMetadata> Node<M> {
     /// The function also handles metadata, IP address, and port changes.
     /// Logs warnings for any detected differences in IP address, port, or metadata.
     pub fn merge(&mut self, other: &Node<M>) -> Result<bool> {
-        // Thoughts:
-        // what if a node restarted and incarnation starts counting from 0, and the node rejoins, and by default node
-        // has already been moved to a dead or suspect state on remote memeberhsip of nodes, how can i modify to make it work
-        // There has to be a way to move incarnation ahead.
-        match self.status.incarnation.cmp(&other.status.incarnation) {
-            Ordering::Less => {
-                self.update_all(other);
-                self.log_differences(other);
-                Ok(true)
-            }
-            Ordering::Equal => {
-                if other.status.state.precedence() > self.status.state.precedence() 
-                   || (other.status.state == self.status.state && other.status.last_updated > self.status.last_updated)
-                   || (self.status.state == NodeState::Dead && other.status.state == NodeState::Alive) {
-                    self.update_all(other);
-                    self.log_differences(other);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-            Ordering::Greater => Ok(false),
+        if self.name != other.name {
+            return Err(anyhow::anyhow!("Cannot merge nodes with different names"));
         }
-    }
 
-    /// Check and log changes
-    fn log_differences(&self, other: &Node<M>) {
-        if self.ip_addr != other.ip_addr {
-            warn!("IP address changed from {} to {}", self.ip_addr, other.ip_addr);
-        }
-        if self.port != other.port {
-            warn!("Port changed from {} to {}", self.port, other.port);
-        }
-        if self.metadata != other.metadata {
-            warn!("Metadata has changed");
-        }
-    }
-
-    fn update_all(&mut self, other: &Node<M>) {
-        self.status = other.status.clone();
-        self.metadata = other.metadata.clone();
-        self.ip_addr = other.ip_addr;
-        self.port = other.port;
-    }
-
-    /// Checks if the Node has been in the Suspect state for longer than the given timeout.
-    pub fn suspect_timeout(&self, timeout: Duration) -> Result<bool> {
-        if self.status.state != NodeState::Suspect {
+        // Check if we're leaving the cluster
+        if self.state() == NodeState::Leaving {
             return Ok(false);
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        let mut changed = false;
 
-        let time_in_suspect_state = now.saturating_sub(self.status.last_updated.try_into()?);
-        
-        Ok(time_in_suspect_state > timeout.as_secs())
+        // Handle incarnation number conflicts
+        match self.status.incarnation.cmp(&other.status.incarnation) {
+            Ordering::Less => {
+                // Other node has a higher incarnation, accept all its data
+                changed |= self.handle_higher_incarnation(other);
+            }
+            Ordering::Equal => {
+                changed |= self.resolve_equal_incarnation(other);
+            }
+            Ordering::Greater => {
+                warn!("Received update for node '{}' with lower incarnation {} (current is {})",
+              self.name, other.status.incarnation, self.status.incarnation);
+
+                // Our incarnation is higher, but check for the restart scenario
+                if self.state() == NodeState::Dead && other.state() == NodeState::Alive {
+                    // Allow a "DEAD" node to come back to life, even with a lower incarnation
+                    // The downside here is that it's hard to tell if the message that triggered this 
+                    // is an old data, E.G UDP packets are not delivered in order which means an 
+                    // ALIVE message arrived late even though it was published before a DEAD message
+                    // for this particular node. I might end up removing this, if a node comes back to live
+                    // we will expose an API that allows developer to pass persisted incarnation back to us , next the 
+                    // incarnation and disseminate a join message to the cluster. this will force nodes to accept
+                    // the changes.
+                    self.status.state = other.state();
+                    self.status.last_updated = other.status.last_updated;
+                    changed = true;
+                }
+            }
+        }
+
+        // Always update network info if changed, regardless of incarnation
+        changed |= self.update_network_info(other);
+
+        if changed {
+            self.log_differences(other);
+        }
+
+        Ok(changed)
     }
+    // Resolve equal incarnation based on state precedence and update time
+    fn resolve_equal_incarnation(&mut self, other: &Node<M>) -> bool {
+        let mut changed = false;
+
+        if other.status.state.precedence() > self.status.state.precedence() 
+           || (other.status.state == self.status.state && other.status.last_updated > self.status.last_updated)
+           || (self.status.state == NodeState::Dead && other.status.state == NodeState::Alive) {
+            self.status.state = other.status.state;
+            self.status.last_updated = other.status.last_updated;
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn handle_higher_incarnation(&mut self, other: &Node<M>) -> bool {
+        let mut changed = false;
+
+        if self.status != other.status {
+            self.status = other.status.clone();
+            changed = true;
+        }
+
+        changed |= self.update_network_info(other);
+
+        changed
+    }
+
+    fn update_network_info(&mut self, other: &Node<M>) -> bool {
+        let mut changed = false;
+
+        if self.ip_addr != other.ip_addr {
+            self.ip_addr = other.ip_addr;
+            changed = true;
+        }
+
+        if self.port != other.port {
+            self.port = other.port;
+            changed = true;
+        }
+
+        if self.metadata != other.metadata {
+            self.metadata = other.metadata.clone();
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn log_differences(&self, other: &Node<M>) {
+        if self.status.incarnation != other.status.incarnation {
+            warn!("Incarnation changed for node '{}' from {} to {}", self.name, self.status.incarnation, other.status.incarnation);
+        }
+        if self.status.state != other.status.state {
+            warn!("State changed for node '{}' from {:?} to {:?}", self.name, self.status.state, other.status.state);
+        }
+        if self.ip_addr != other.ip_addr {
+            warn!("IP address changed for node '{}' from {} to {}", self.name, self.ip_addr, other.ip_addr);
+        }
+        if self.port != other.port {
+            warn!("Port changed for node '{}' from {} to {}", self.name, self.port, other.port);
+        }
+        if self.metadata != other.metadata {
+            warn!("Metadata changed for node '{}'", self.name);
+        }
+    }
+
 }
 
 impl<M> PartialOrd for Node<M>

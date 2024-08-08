@@ -12,12 +12,31 @@ pub(crate) enum EventType {
     SuspectTimeout { node: String },
 }
 
+/// Represents the current state of a scheduled event in the EventScheduler.
+///
+/// The lifecycle of an event typically progresses as follows:
+/// 1. An event is initially created in the `Pending` state.
+/// 2. If the event reaches its scheduled time, it transitions to the `ReachedDeadline` state.
+/// 3. If the event is handled before its scheduled time, it moves to the `Intercepted` state.
+/// 4. At any point before timing out or being intercepted, an event can be explicitly `Cancelled`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EventState {
+    /// The initial state of a newly scheduled event.
     Pending,
-    Completed,
+
+    /// Indicates that the event has reached its scheduled time and has been picked up by the system.
+    /// This state suggests that the associated action or check should now be performed.
+    ReachedDeadline,
+
+    /// Represents an event that was handled before its scheduled time due to external factors.
+    /// This could occur when a condition is met earlier than expected.
     Intercepted,
+
+    /// Indicates that the event was explicitly cancelled before it could time out or be intercepted.
+    /// This might happen if the event becomes irrelevant or unnecessary before its scheduled time.
+    Cancelled,
 }
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct EventId(u64);
@@ -34,20 +53,22 @@ impl PartialOrd for EventId {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct Event {
     pub(crate) state: EventState,
     pub(crate) sender: mpsc::Sender<EventState>,
 }
 
-pub(crate) struct EventManager {
+pub(crate) struct EventScheduler {
     events: Arc<RwLock<BinaryHeap<(Instant, EventId)>>>,
     event_map: Arc<RwLock<HashMap<EventType, (EventId, Event)>>>,
     event_counter: std::sync::atomic::AtomicU64,
 }
 
-impl EventManager {
+impl EventScheduler {
+    // Create new EventScheduler Instance
     pub(crate) fn new() -> Self {
-        EventManager {
+        EventScheduler {
             events: Arc::new(RwLock::new(BinaryHeap::new())),
             event_map: Arc::new(RwLock::new(HashMap::new())),
             event_counter: std::sync::atomic::AtomicU64::new(0),
@@ -60,7 +81,7 @@ impl EventManager {
         &self,
         event_type: EventType,
         deadline: Instant,
-    ) -> Result<mpsc::Receiver<EventState>> {
+    ) -> Result<(mpsc::Receiver<EventState>, mpsc::Sender<EventState>)> {
         let mut event_map = self.event_map.write().await;
         if event_map.contains_key(&event_type) {
             return Err(anyhow!("An event of this type already exists"));
@@ -71,13 +92,13 @@ impl EventManager {
 
         let event = Event {
             state: EventState::Pending,
-            sender,
+            sender: sender.clone(),
         };
 
         event_map.insert(event_type, (id.clone(), event));
         self.events.write().await.push((deadline, id));
 
-        Ok(receiver)
+        Ok((receiver, sender))
     }
 
     /// Retrieves the next event that has reached its deadline.
@@ -97,7 +118,7 @@ impl EventManager {
                 if let Some(event_type) = event_entry {
                     if let Some((_, event)) = event_map.remove(&event_type) {
                         return Some((event_type,  Event { 
-                            state: EventState::Completed, 
+                            state: EventState::ReachedDeadline, 
                             sender: event.sender
                         }));
                     }
@@ -126,47 +147,72 @@ impl EventManager {
         })
     }
 
-    /// Retrieves all events that are due up to the current time.
-    /// Returns a vector of event types and event details.
-    pub(crate) async fn next_events(&self) -> Vec<(EventType, Event)> {
+    /// Retrieves a limited number of events that are due up to the current time.
+    /// Returns a vector of event types and event details that reached it's deadline
+    pub(crate) async fn next_events(&self, limit: usize) -> Vec<(EventType, Event)> {
         let now = Instant::now();
-        let mut events = self.events.write().await;
-        let mut event_map = self.event_map.write().await;
-        let mut due_events = Vec::new();
+        let mut due_events = Vec::with_capacity(limit);
+        let mut processed = 0;
+
+        loop {
+            // Acquire read lock to check if there's work to do
+            let events = self.events.read().await;
+            if events.is_empty() || events.peek().map_or(true, |(time, _)| *time > now) || processed >= limit {
+                break;
+            }
+            drop(events);
+
+            // Process one event at a time
+            if let Some((event_type, event)) = self.process_next_event().await {
+                due_events.push((event_type, event));
+                processed += 1;
+            } else {
+                break;
+            }
+        }
+
+        due_events
+    }
+
+    async fn process_next_event(&self) -> Option<(EventType, Event)> {
+        let now = Instant::now();
         
-        while let Some((time, _)) = events.peek() {
-            if *time <= now {
-                let id = events.pop().unwrap().1;
+        // Acquire write locks for a short duration
+        let mut events = self.events.write().await;
+        if let Some((time, id)) = events.pop() {
+            if time <= now {
+                drop(events);
+                let mut event_map = self.event_map.write().await;
                 let event_entry = event_map.iter()
                     .find(|(_, (event_id, _))| event_id == &id)
                     .map(|(event_type, _)| event_type.clone());
 
                 if let Some(event_type) = event_entry {
                     if let Some((_, event)) = event_map.remove(&event_type) {
-                        due_events.push((event_type, Event { 
-                            state: EventState::Completed, 
+                        return Some((event_type,  Event { 
+                            state: EventState::ReachedDeadline, 
                             sender: event.sender
                         }));
                     }
                 }
             } else {
-                break;
+                // If the event is in the future, put it back
+                events.push((time, id));
             }
         }
-        due_events
+        None
     }
     
     /// Intercepts a specified event, changing its state to Intercepted.
     /// Removes the event from both the event map and the event heap.
-    pub(crate) async fn intercept_event(&self, event_type: &EventType) -> Result<()> {
+    pub(crate) async fn try_intercept_event(&self, event_type: &EventType) -> Result<()> {
         let mut event_map = self.event_map.write().await;
         
         if let Some((id, event)) = event_map.remove(event_type) {
-            let _ = event.sender.send(EventState::Intercepted).await;
+            event.sender.send(EventState::Intercepted).await?;
             // Remove the event from the events heap as well
             let mut events = self.events.write().await;
             events.retain(|&(_, ref e_id)| e_id != &id);
-            
             Ok(())
         } else {
             Err(anyhow!("Event not found"))
@@ -175,7 +221,7 @@ impl EventManager {
 
     /// Cancels a specified event by intercepting it.
     pub(crate) async fn cancel_event(&self, event_type: &EventType) -> Result<()> {
-        self.intercept_event(event_type).await
+        self.try_intercept_event(event_type).await
     }
 }
 
@@ -186,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_schedule_and_next_event() {
-        let manager = EventManager::new();
+        let manager = EventScheduler::new();
         let now = Instant::now();
         let event_type = EventType::SuspectTimeout { node: "node".to_string() };
         
@@ -202,13 +248,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_intercept_event() {
-        let manager = EventManager::new();
+        let manager = EventScheduler::new();
         let now = Instant::now();
         let event_type = EventType::SuspectTimeout { node: "node".to_string() };
         
-        let mut receiver = manager.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await.unwrap();
+        let (mut receiver, _) = manager.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await.unwrap();
         
-        manager.intercept_event(&event_type).await.unwrap();
+        manager.try_intercept_event(&event_type).await.unwrap();
         
         let result = timeout(Duration::from_millis(100), receiver.recv()).await;
         assert!(result.is_ok());
@@ -217,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_event_type() {
-        let manager = EventManager::new();
+        let manager = EventScheduler::new();
         let now = Instant::now();
         let event_type = EventType::SuspectTimeout { node: "node".to_string() };
         

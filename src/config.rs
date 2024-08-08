@@ -6,34 +6,75 @@ use std::time::Duration;
 use anyhow::Result;
 use crate::ip_addr::IpAddress;
 
+// Default configuration constants
 pub(crate) const DEFAULT_IP_ADDR: &str = "127.0.0.1";
 pub(crate) const DEFAULT_PORT: u16 = 5870;
-pub(crate) const DEFAULT_PING_TIMEOUT: u64 = 10_000; 
-pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 10_000;
-pub(crate) const DEFAULT_GOSSIP_INTERVAL: u64 = 5_000; 
-pub(crate) const DEFAULT_PROBING_INTERVAL: u64 = 10_000; 
-pub(crate) const DEFAULT_SUSPECT_TIMEOUT: u64 = 10_000; 
-pub(crate) const DEFAULT_PROBING_TIMEOUT: u64 = 12_000; 
+pub(crate) const DEFAULT_BASE_PROBING_INTERVAL: u64 = 1_000; // 1 second base interval
+pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 500; // 500 milliseconds
+pub(crate) const DEFAULT_INDIRECT_ACK_TIMEOUT: u64 = 1_000; // 1 second
+pub(crate) const DEFAULT_BASE_SUSPICIOUS_TIMEOUT: u64 = 5_000; // 5 seconds
 pub(crate) const DEFAULT_MESSAGE_BUFFER_SIZE: usize = 1_024; 
 pub(crate) const DEFAULT_TRANSPORT_TIMEOUT: u64 = 5_000;
 pub(crate) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 100;
 pub(crate) const MAX_RETRY_DELAY: u64 = 60; // in secs
-pub(crate) const MAX_CONSECUTIVE_FAILURES: u32 = 2;
 pub(crate) const MAX_UDP_PACKET_SIZE: usize = 1400; 
 pub(crate) const BROADCAST_FANOUT: usize = 2; 
-pub(crate) const INDIRECT_REQ: u32 = 2;
+pub(crate) const INDIRECT_REQ: usize = 2;
 
+/// Represents the type of network environment the gossip protocol is operating in.
+/// This affects various timing and timeout calculations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NetworkType {
+    /// Local network (e.g., localhost or same machine)
+    /// Characterized by very low latency and high reliability
+    Local,
+    /// Local Area Network (LAN)
+    /// Typically has low latency and high reliability
+    LAN,
+    /// Wide Area Network (WAN)
+    /// Can have higher latency and lower reliability compared to LAN
+    WAN,
+}
+
+impl Default for NetworkType {
+    fn default() -> Self {
+        NetworkType::Local
+    }
+}
+
+/// Main configuration structure for the Gossipod protocol
 #[derive(Debug, Clone)]
 pub struct GossipodConfig {
+    /// Name of the node, used for identification in the cluster
     pub(crate) name: String,
+
+    /// Port number on which the node will listen for gossip messages
     pub(crate) port: u16,
+
+    /// List of IP addresses the node will bind to
     pub(crate) ip_addrs: Vec<IpAddr>,
-    pub(crate) ping_timeout: Duration,
+
+    /// Base interval for probing other nodes in the cluster
+    /// This value is adjusted based on cluster size and network type
+    pub(crate) base_probing_interval: Duration,
+
+    /// Timeout for receiving an ACK after sending a direct probe
+    /// This is a fixed value, not affected by cluster size or network type
     pub(crate) ack_timeout: Duration,
-    pub(crate) gossip_interval: Duration,
-    pub(crate) probing_interval: Duration,
-    pub(crate) suspect_timeout: Duration,
+
+    /// Timeout for receiving an ACK after sending an indirect probe
+    /// This is a fixed value, not affected by cluster size or network type
+    pub(crate) indirect_ack_timeout: Duration,
+
+    /// Base timeout for considering a node suspicious
+    /// This value is adjusted based on cluster size
+    pub(crate) base_suspicious_timeout: Duration,
+
+    /// Type of network the node is operating in (Local, LAN, or WAN)
+    /// This affects various timing calculations
+    pub(crate) network_type: NetworkType,
 }
+
 
 impl GossipodConfig {
     /// Get the IP addresses.
@@ -52,36 +93,66 @@ impl GossipodConfig {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// Calculates the probing interval based on cluster size and network type
+    ///
+    /// The probing interval increases logarithmically with cluster size to reduce
+    /// network load in larger clusters. It's further adjusted based on the network type:
+    /// - Local: No additional adjustment
+    /// - LAN: 1.5x increase to account for slightly higher latency
+    /// - WAN: 3x increase to account for significantly higher latency
+    pub(crate) fn probing_interval(&self, cluster_size: usize) -> Duration {
+        let base_ms = self.base_probing_interval.as_millis() as f64;
+        let log_factor = (cluster_size as f64).ln().max(1.0);
+        let interval_ms = base_ms * log_factor;
+        let network_factor = match self.network_type {
+            NetworkType::Local => 1.0,
+            NetworkType::LAN => 1.5,
+            NetworkType::WAN => 3.0,
+        };
+        Duration::from_millis((interval_ms * network_factor) as u64)
+    }
+
+    /// Returns the fixed ACK timeout
+    ///
+    /// This timeout is used when waiting for an ACK after sending a direct probe.
+    /// It's a fixed value and not affected by cluster size or network type.
+    pub fn ack_timeout(&self) -> Duration {
+        self.ack_timeout
+    }
+
+    /// Returns the fixed indirect ACK timeout
+    ///
+    /// This timeout is used when waiting for an ACK after sending an indirect probe.
+    /// It's a fixed value and not affected by cluster size or network type.
+    pub fn indirect_ack_timeout(&self) -> Duration {
+        self.indirect_ack_timeout
+    }
+
+    /// Calculates the suspicious timeout based on cluster size
+    ///
+    /// The suspicious timeout increases logarithmically with cluster size to reduce
+    /// false positives in larger clusters. It's not directly affected by network type,
+    /// but the base value can be set differently for different network types if needed.
+    pub(crate) fn suspicious_timeout(&self, cluster_size: usize) -> Duration {
+        let base_ms = self.base_suspicious_timeout.as_millis() as f64;
+        let log_factor = (cluster_size as f64).ln().max(1.0);
+        Duration::from_millis((base_ms * log_factor) as u64)
+    }
+
 }
 
-// Configuration for SWIM protocol.
 #[derive(Debug, Clone)]
 pub struct GossipodConfigBuilder {
-    /// Optional name for the node.
     pub(crate) name: Option<String>,
-    
-    /// Port on which the node will bind.
     pub(crate) port: u16,
-    
-    /// IP address the node will bind to.
     pub(crate) ip_addrs: Vec<IpAddr>,
-    
-    /// Timeout for ping messages.
-    pub(crate) ping_timeout: Duration,
-    
-    /// Timeout for ack messages.
+    pub(crate) base_probing_interval: Duration,
     pub(crate) ack_timeout: Duration,
- 
-    /// Interval between gossip protocol messages.
-    pub(crate) gossip_interval: Duration,
-
-    /// Interval between probing protocol messages.
-    pub(crate) probing_interval: Duration,
-    
-    /// Timeout to mark a node as suspect.
-    pub(crate) suspect_timeout: Duration,
+    pub(crate) indirect_ack_timeout: Duration,
+    pub(crate) base_suspicious_timeout: Duration,
+    pub(crate) network_type: NetworkType,
 }
-
 
 impl Default for GossipodConfigBuilder {
     fn default() -> GossipodConfigBuilder {
@@ -92,134 +163,85 @@ impl Default for GossipodConfigBuilder {
             name: None,
             port: DEFAULT_PORT,
             ip_addrs: vec![ip_addr],
-            ping_timeout: Duration::from_millis(DEFAULT_PING_TIMEOUT),
+            base_probing_interval: Duration::from_millis(DEFAULT_BASE_PROBING_INTERVAL),
             ack_timeout: Duration::from_millis(DEFAULT_ACK_TIMEOUT),
-            gossip_interval: Duration::from_millis(DEFAULT_GOSSIP_INTERVAL),
-            probing_interval: Duration::from_millis(DEFAULT_PROBING_INTERVAL),
-            suspect_timeout: Duration::from_millis(DEFAULT_SUSPECT_TIMEOUT),
+            indirect_ack_timeout: Duration::from_millis(DEFAULT_INDIRECT_ACK_TIMEOUT),
+            base_suspicious_timeout: Duration::from_millis(DEFAULT_BASE_SUSPICIOUS_TIMEOUT),
+            network_type: NetworkType::default(),
         }
     }
 }
 
 impl GossipodConfigBuilder {
-    /// Creates a new instance of `GossipodConfigBuilder` with default values.
+    /// Creates a new GossipodConfigBuilder with default values
     pub fn new() -> Self {
         Self::default()
     }
-    
-    /// Sets the name for the node.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - A string-like value that can be converted into a `String`.
-    ///
-    /// # Returns
-    ///
-    /// Returns `self` to allow for method chaining.
+
+    /// Sets the name of the node
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
-    /// Sets the port to bind to.
-    ///
-    /// # Arguments
-    ///
-    /// * `port` - A `u16` value representing the port number.
-    ///
-    /// # Returns
-    ///
-    /// Returns `self` to allow for method chaining.
+    /// Sets the port number for the node
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
 
-    /// Sets the IP address to bind to.
-    ///
-    /// # Arguments
-    ///
-    /// * `addr` - An `IpAddress` or a type that can be converted into an `IpAddress`.
-    ///
-    /// # Returns
-    ///
-    /// Returns `self` to allow for method chaining.
+    /// Sets the IP address for the node
     pub fn addr(mut self, addr: impl Into<IpAddress>) -> Self {
         self.ip_addrs = vec![addr.into().0];
         self
     }
 
-    /// Sets the ping timeout duration.
+    /// Sets the base probing interval
     ///
-    /// # Arguments
-    ///
-    /// * `timeout` - A `Duration` representing the ping timeout.
-    ///
-    /// # Returns
-    ///
-    /// Returns `self` to allow for method chaining.
-    pub fn ping_timeout(mut self, timeout: Duration) -> Self {
-        self.ping_timeout = timeout;
+    /// This is the starting point for calculating the actual probing interval,
+    /// which will be adjusted based on cluster size and network type.
+    pub fn probing_interval(mut self, interval: Duration) -> Self {
+        self.base_probing_interval = interval;
         self
     }
 
-    /// Sets the acknowledgment timeout duration.
+    /// Sets the ACK timeout
     ///
-    /// # Arguments
-    ///
-    /// * `timeout` - A `Duration` representing the acknowledgment timeout.
-    ///
-    /// # Returns
-    ///
-    /// Returns `self` to allow for method chaining.
+    /// This is a fixed timeout used when waiting for an ACK after sending a direct probe.
     pub fn ack_timeout(mut self, timeout: Duration) -> Self {
         self.ack_timeout = timeout;
         self
     }
 
-    /// Sets the gossip interval duration.
+    /// Sets the indirect ACK timeout
     ///
-    /// # Arguments
+    /// This is a fixed timeout used when waiting for an ACK after sending an indirect probe.
+    pub fn indirect_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.indirect_ack_timeout = timeout;
+        self
+    }
+
+    /// Sets the base suspicious timeout
     ///
-    /// * `interval` - A `Duration` representing the interval between gossip protocol messages.
-    ///
-    /// # Returns
-    ///
-    /// Returns `self` to allow for method chaining.
-    pub fn gossip_interval(mut self, interval: Duration) -> Self {
-        self.gossip_interval = interval;
+    /// This is the starting point for calculating the actual suspicious timeout,
+    /// which will be adjusted based on cluster size.
+    pub fn suspicious_timeout(mut self, timeout: Duration) -> Self {
+        self.base_suspicious_timeout = timeout;
         self
     }
 
 
-    /// Sets the probing interval duration.
+    /// Sets the network type (Local, LAN, or WAN)
     ///
-    /// # Arguments
-    ///
-    /// * `interval` - A `Duration` representing the interval between probing protocol messages.
-    ///
-    /// # Returns
-    ///
-    /// Returns `self` to allow for method chaining.
-    pub fn probing_interval(mut self, interval: Duration) -> Self {
-        self.probing_interval = interval;
+    /// This affects various timing calculations, particularly the probing interval.
+    pub fn network_type(mut self, network_type: NetworkType) -> Self {
+        self.network_type = network_type;
         self
     }
 
-    /// Sets the suspect timeout duration.
+    /// Validates the current configuration
     ///
-    /// # Arguments
-    ///
-    /// * `timeout` - A `Duration` representing the timeout to mark a node as suspect.
-    ///
-    /// # Returns
-    ///
-    /// Returns `self` to allow for method chaining.
-    pub fn suspect_timeout(mut self, timeout: Duration) -> Self {
-        self.suspect_timeout = timeout;
-        self
-    }
-    /// Validate the configuration to ensure all values are set.
+    /// Checks that all necessary fields are set and have non-zero values where appropriate.
     pub(crate) fn validate(&self) -> Result<()> {
         if self.ip_addrs.is_empty() {
             anyhow::bail!("bind address is not set");
@@ -227,24 +249,26 @@ impl GossipodConfigBuilder {
         if self.port == 0 {
             anyhow::bail!("bind port is not set");
         }
-        if self.ping_timeout.as_millis() == 0 {
-            anyhow::bail!("ping timeout is not set");
-        }
-        if self.probing_interval.as_millis() == 0 {
-            anyhow::bail!("probing timeout is not set");
+        if self.base_probing_interval.as_millis() == 0 {
+            anyhow::bail!("base probing interval is not set");
         }
         if self.ack_timeout.as_millis() == 0 {
-            anyhow::bail!("ack timeout is not set");
+            anyhow::bail!("ACK timeout is not set");
         }
-        if self.gossip_interval.as_millis() == 0 {
-            anyhow::bail!("gossip interval is not set");
+        if self.indirect_ack_timeout.as_millis() == 0 {
+            anyhow::bail!("indirect ACK timeout is not set");
         }
-        if self.suspect_timeout.as_millis() == 0 {
-            anyhow::bail!("suspect timeout is not set");
+        if self.base_suspicious_timeout.as_millis() == 0 {
+            anyhow::bail!("base suspicious timeout is not set");
         }
+       
         Ok(())
     }
 
+    /// Builds the final GossipodConfig
+    ///
+    /// This method validates the configuration and creates a GossipodConfig instance.
+    /// If the name is not set, it uses the hostname of the machine.
     pub async fn build(mut self) -> Result<GossipodConfig> {
         self.fill();
         self.validate()?;
@@ -253,18 +277,18 @@ impl GossipodConfigBuilder {
             name: self.name.unwrap(),
             port: self.port,
             ip_addrs: self.ip_addrs,
-            ping_timeout: self.ping_timeout,
+            base_probing_interval: self.base_probing_interval,
             ack_timeout: self.ack_timeout,
-            gossip_interval: self.gossip_interval,
-            suspect_timeout: self.suspect_timeout,
-            probing_interval: self.probing_interval,
+            indirect_ack_timeout: self.indirect_ack_timeout,
+            base_suspicious_timeout: self.base_suspicious_timeout,
+            network_type: self.network_type,
         })
     }
 
+    /// Fills in any missing fields with default values
     fn fill(&mut self) {
         if self.name.is_none() {
             self.name = Some(gethostname().into_string().unwrap())
         }
     }
 }
-
