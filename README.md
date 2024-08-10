@@ -162,6 +162,7 @@ tokio::spawn(gossipod.clone().start());
 while !gossipod.is_running().await {
     time::sleep(Duration::from_millis(100)).await;
 }
+```
 
 ## Reference
 - SWIM: Scalable Weakly-consistent Infection-style Process Group Membership
