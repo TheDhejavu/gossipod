@@ -964,9 +964,13 @@ where
         let local_node = self.get_local_node().await?;
         let local_addr = local_node.socket_addr()?;
 
+        let dead_node_gossip_window = self.inner.config.dead_node_gossip_window();
         let known_nodes = self.inner.members.select_random_gossip_nodes(
             BROADCAST_FANOUT,
-            Some(|n: &Node<M>| !n.is_alive() || n.socket_addr().map_or(true, |addr| addr == local_addr))
+            Some(|n: &Node<M>| {
+                n.socket_addr().map_or(true, |addr| addr == local_addr)
+                || (n.is_dead() && !n.is_within_dead_gossip_window(dead_node_gossip_window).unwrap_or(false))
+            })
         ).unwrap_or_default();
 
         if known_nodes.is_empty() {
@@ -1054,7 +1058,7 @@ where
                 }
             },
             _ => {
-                warn!("Received non-Ping message in handle_ping from {}", sender);
+                warn!("Received Non-Ping message in handle_ping from {}", sender);
                 return Err(anyhow!("Unexpected message type in handle_ping"));
             }
         }
@@ -1124,7 +1128,7 @@ where
                 );
     
                 let ack_deadline = now + self.inner.config.ack_timeout;
-                let (mut rx, tx) = self.inner.event_scheduler.schedule_event(
+                let (mut rx, _) = self.inner.event_scheduler.schedule_event(
                     EventType::Ack{ 
                         sequence_number  
                     },

@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
 use log::warn;
 use serde::{Serialize, Deserialize};
@@ -36,6 +36,7 @@ pub struct NodeStatus {
     incarnation: u64,
     pub state: NodeState,
     last_updated: u128,
+    last_state_changed: u128,
 }
 
 impl NodeStatus {
@@ -45,15 +46,21 @@ impl NodeStatus {
             incarnation,
             state,
             last_updated: 0,
+            last_state_changed: 0,
         }
     }
 
     /// Updates the state of the Node and records the time of change.
     pub(crate) fn update_state(&mut self, new_state: NodeState) -> Result<()> {
-        self.state = new_state;
-        self.last_updated = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis();
+
+        if self.state != new_state {
+            self.last_state_changed = now;
+        }
+        self.state = new_state;
+        self.last_updated = now;
 
         Ok(())
     }
@@ -289,6 +296,18 @@ impl<M: NodeMetadata> Node<M> {
         self.status.incarnation
     }
 
+    /// Checks if the node is within the dead node gossip window
+    pub(crate) fn is_within_dead_gossip_window(&self, dead_node_gossip_window: Duration) -> Result<bool> {
+        if self.status.state != NodeState::Dead {
+            return Ok(false);
+        }
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let time_since_death = now - self.status.last_state_changed;
+
+        Ok(time_since_death <= dead_node_gossip_window.as_millis() as u128)
+    }
+
     // Merges the state of another Node into this Node.
     ///
     /// This function is the central point for handling conflicting data between nodes.
@@ -319,14 +338,14 @@ impl<M: NodeMetadata> Node<M> {
         match self.status.incarnation.cmp(&other.status.incarnation) {
             Ordering::Less => {
                 // Other node has a higher incarnation, accept all its data
-                changed |= self.handle_higher_incarnation(other);
+                changed |= self.handle_higher_incarnation(other)?;
             }
             Ordering::Equal => {
-                changed |= self.resolve_equal_incarnation(other);
+                changed |= self.resolve_equal_incarnation(other)?;
             }
             Ordering::Greater => {
                 warn!("Received update for node '{}' with lower incarnation {} (current is {})",
-              self.name, other.status.incarnation, self.status.incarnation);
+                self.name, other.status.incarnation, self.status.incarnation);
 
                 // Our incarnation is higher, but check for the restart scenario
                 if self.state() == NodeState::Dead && other.state() == NodeState::Alive {
@@ -338,8 +357,10 @@ impl<M: NodeMetadata> Node<M> {
                     // we will expose an API that allows developer to pass persisted incarnation back to us , next the 
                     // incarnation and disseminate a join message to the cluster. this will force nodes to accept
                     // the changes.
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+
                     self.status.state = other.state();
-                    self.status.last_updated = other.status.last_updated;
+                    self.status.last_state_changed = now;
                     changed = true;
                 }
             }
@@ -349,37 +370,40 @@ impl<M: NodeMetadata> Node<M> {
         changed |= self.update_network_info(other);
 
         if changed {
+            self.status.last_updated = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
             self.log_differences(other);
         }
 
         Ok(changed)
     }
     // Resolve equal incarnation based on state precedence and update time
-    fn resolve_equal_incarnation(&mut self, other: &Node<M>) -> bool {
+    fn resolve_equal_incarnation(&mut self, other: &Node<M>) -> Result<bool> {
         let mut changed = false;
-
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        
         if other.status.state.precedence() > self.status.state.precedence() 
-           || (other.status.state == self.status.state && other.status.last_updated > self.status.last_updated)
            || (self.status.state == NodeState::Dead && other.status.state == NodeState::Alive) {
             self.status.state = other.status.state;
-            self.status.last_updated = other.status.last_updated;
+            self.status.last_state_changed = now;
             changed = true;
         }
 
-        changed
+        Ok(changed)
     }
 
-    fn handle_higher_incarnation(&mut self, other: &Node<M>) -> bool {
+    fn handle_higher_incarnation(&mut self, other: &Node<M>) -> Result<bool>  {
         let mut changed = false;
-
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        
         if self.status != other.status {
             self.status = other.status.clone();
+            self.status.last_state_changed = now;
             changed = true;
         }
 
         changed |= self.update_network_info(other);
 
-        changed
+        Ok(changed)
     }
 
     fn update_network_info(&mut self, other: &Node<M>) -> bool {

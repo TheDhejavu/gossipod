@@ -78,10 +78,10 @@ impl SwimNode {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    // self.send_ping_to_all(&mut counter).await;
+                    self.send_ping_to_all(&mut counter).await;
                 }
                 Some(data) = self.msg_ch.recv() => {
-                    // self.handle_incoming_message(data, &mut counter).await;
+                    self.handle_incoming_message(data, &mut counter).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Signal received, stopping Gossipod...");

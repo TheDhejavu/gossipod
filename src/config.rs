@@ -11,6 +11,7 @@ use crate::broadcast_queue::{DefaultBroadcastQueue, BroadcastQueue};
 // Default configuration constants
 pub(crate) const DEFAULT_IP_ADDR: &str = "127.0.0.1";
 pub(crate) const DEFAULT_PORT: u16 = 5870;
+pub(crate) const DEFAULT_DEAD_NODE_GOSSIP_WINDOW: u64 = 3_600_000; // 1 hour in milliseconds
 pub(crate) const DEFAULT_BASE_PROBING_INTERVAL: u64 = 1_000; // 1 second base interval
 pub(crate) const DEFAULT_BASE_GOSSIP_INTERVAL: u64 = 1_000; // 1 second base interval
 pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 500; // 500 milliseconds
@@ -80,7 +81,12 @@ pub struct GossipodConfig {
     /// This affects various timing calculations
     pub(crate) network_type: NetworkType,
 
+    // Initial cluster size
     pub(crate) initial_cluster_size: usize,
+
+    /// The time window during which supposedly dead nodes are still included in gossip,
+    /// allowing them an opportunity to refute their dead status if they're actually alive.
+    pub(crate) dead_node_gossip_window: Duration,
 }
 
 impl Clone for GossipodConfig {
@@ -96,6 +102,7 @@ impl Clone for GossipodConfig {
             base_suspicious_timeout: self.base_suspicious_timeout,
             network_type: self.network_type.clone(),
             initial_cluster_size: self.initial_cluster_size,
+            dead_node_gossip_window: self.dead_node_gossip_window,
         }
     }
 }
@@ -164,6 +171,12 @@ impl GossipodConfig {
         Duration::from_millis((base_ms * log_factor) as u64)
     }
 
+    /// Returns the time window during which supposedly dead nodes are still gossiped about,
+    /// giving them a chance to prove they're alive.
+    pub fn dead_node_gossip_window(&self) -> Duration {
+        self.dead_node_gossip_window
+    }
+
 }
 
 
@@ -178,6 +191,7 @@ pub struct GossipodConfigBuilder {
     pub(crate) base_suspicious_timeout: Duration,
     pub(crate) network_type: NetworkType,
     pub(crate) initial_cluster_size: usize,
+    pub(crate) dead_node_gossip_window: Duration,
 }
 
 impl Default for GossipodConfigBuilder {
@@ -196,6 +210,7 @@ impl Default for GossipodConfigBuilder {
             network_type: NetworkType::default(),
             base_gossip_interval:  Duration::from_millis(DEFAULT_BASE_GOSSIP_INTERVAL),
             initial_cluster_size: 1,
+            dead_node_gossip_window:  Duration::from_millis(DEFAULT_DEAD_NODE_GOSSIP_WINDOW),
         }
     }
 }
@@ -239,6 +254,12 @@ impl GossipodConfigBuilder {
         self
     }
 
+    /// Sets the time window for gossiping about supposedly dead nodes.
+    /// This window allows potentially alive nodes to refute their dead status.
+    pub fn dead_node_gossip_window(mut self, window: Duration) -> Self {
+        self.dead_node_gossip_window = window;
+        self
+    }
     /// Sets the ACK timeout
     ///
     /// This is a fixed timeout used when waiting for an ACK after sending a direct probe.
@@ -283,6 +304,9 @@ impl GossipodConfigBuilder {
         if self.port == 0 {
             anyhow::bail!("bind port is not set");
         }
+        if self.dead_node_gossip_window.as_millis() == 0 {
+            anyhow::bail!("dead node gossip window must be greater than zero");
+        }
         if self.initial_cluster_size == 0 {
             anyhow::bail!("cluster size must be greater than zero(0)");
         }
@@ -321,6 +345,7 @@ impl GossipodConfigBuilder {
             base_suspicious_timeout: self.base_suspicious_timeout,
             network_type: self.network_type,
             initial_cluster_size: self.initial_cluster_size,
+            dead_node_gossip_window: self.dead_node_gossip_window,
         })
     }
 
