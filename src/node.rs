@@ -553,13 +553,13 @@ mod tests {
         assert_eq!(new_node.status.state, NodeState::Dead);
         assert_eq!(prev_node.status.state, NodeState::Dead);
     
-        // Test: Equal incarnation and state, more recent change wins
+        // Test: Equal incarnation and state, should update only last_updated 
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(prev_node.status.incarnation, new_node.status.incarnation);
         new_node.update_state(NodeState::Dead).expect("Failed to update new_node state to Dead");
     
-        assert!(prev_node.merge(&new_node).expect("Merge operation failed"));
-        assert_eq!(prev_node.status.last_updated, new_node.status.last_updated);
+        assert!(!prev_node.merge(&new_node).expect("Merge should not occur"));
+        assert!(new_node.status.last_updated > prev_node.status.last_updated);
     
         // Test: Lower incarnation doesn't overwrite (no-op)
         prev_node.status.increment_incarnation().expect("Failed to increment prev_node incarnation");
