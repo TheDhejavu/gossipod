@@ -92,6 +92,8 @@ includes a number of demos. Below you can run two different instances of gossipo
 > cargo run --example pong_node -- --name=NODE_2 --port=7947 --join-addr=127.0.0.1:7948
 ```
 
+#### [Demos](https://github.com/TheDhejavu/gossipod-examples)
+
 # Gossipod API
 
 ### Creating a new Gossipod instance
@@ -160,24 +162,6 @@ tokio::spawn(gossipod.clone().start());
 while !gossipod.is_running().await {
     time::sleep(Duration::from_millis(100)).await;
 }
-
-// Set up a receiver
-let mut receiver = gossipod.with_receiver(100).await;
-
-// Main loop
-loop {
-    tokio::select! {
-        Some(data) = receiver.recv() => {
-            // Handle incoming message
-        }
-        _ = tokio::signal::ctrl_c() => {
-            gossipod.stop().await?;
-            break;
-        }
-    }
-}
-```
-
 
 ## Reference
 - SWIM: Scalable Weakly-consistent Infection-style Process Group Membership
