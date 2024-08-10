@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
 
     // Use Default broadcast Queue
     let broadcast_queue =  Arc::new(DefaultBroadcastQueue::new(1));
-    let gossipod = Gossipod::with_custom(config, metadata, broadcast_queue)
+    let gossipod = Gossipod::with_custom(config, metadata, broadcast_queue, None)
         .await
         .context("Failed to initialize Gossipod with custom metadata")?;
 
@@ -96,22 +96,6 @@ async fn main() -> Result<()> {
     } else {
         info!("No join address specified. Running as a standalone node.");
     }
-
-    // Initialize the channel and get a receiver
-    let mut receiver = gossipod.with_receiver(100).await;
-
-    // Listen to app specific messages sent from peers
-    let gossipod_clone = gossipod.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                Some(msg) = receiver.recv() => {
-                    println!("Received app message: {:?}", msg);
-                }
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-            }
-        }
-    });
 
     while gossipod.is_running().await {
         time::sleep(Duration::from_secs(1)).await;
