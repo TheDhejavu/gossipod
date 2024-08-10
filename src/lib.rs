@@ -1714,6 +1714,9 @@ where
                                 },
                             };
                             self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
+                            if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
+                                dispatch_handler.notify_join(&node).await?;
+                            }
                         },
                         MergeAction::Updated => {
                             info!("State changed for node {} in the cluster", node.name);
