@@ -89,7 +89,7 @@ impl SwimNode {
         loop {
             tokio::select! {
                 Some(msg) = self.receiver.recv() => {
-                    self.handle_incoming_message(msg).await?;
+                    // self.handle_incoming_message(msg).await?;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Signal received, stopping Gossipod...");

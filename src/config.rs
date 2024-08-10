@@ -1,15 +1,18 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
+use std::sync::Arc;
 use gethostname::gethostname;
 use std::time::Duration;
 
 use anyhow::Result;
 use crate::ip_addr::IpAddress;
+use crate::broadcast_queue::{DefaultBroadcastQueue, BroadcastQueue};
 
 // Default configuration constants
 pub(crate) const DEFAULT_IP_ADDR: &str = "127.0.0.1";
 pub(crate) const DEFAULT_PORT: u16 = 5870;
 pub(crate) const DEFAULT_BASE_PROBING_INTERVAL: u64 = 1_000; // 1 second base interval
+pub(crate) const DEFAULT_BASE_GOSSIP_INTERVAL: u64 = 1_000; // 1 second base interval
 pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 500; // 500 milliseconds
 pub(crate) const DEFAULT_INDIRECT_ACK_TIMEOUT: u64 = 1_000; // 1 second
 pub(crate) const DEFAULT_BASE_SUSPICIOUS_TIMEOUT: u64 = 5_000; // 5 seconds
@@ -43,7 +46,6 @@ impl Default for NetworkType {
 }
 
 /// Main configuration structure for the Gossipod protocol
-#[derive(Debug, Clone)]
 pub struct GossipodConfig {
     /// Name of the node, used for identification in the cluster
     pub(crate) name: String,
@@ -58,6 +60,10 @@ pub struct GossipodConfig {
     /// This value is adjusted based on cluster size and network type
     pub(crate) base_probing_interval: Duration,
 
+    /// Base interval for gossiping with nodes in the cluster
+    /// This value is adjusted based on cluster size and network type
+    pub(crate) base_gossip_interval: Duration,
+
     /// Timeout for receiving an ACK after sending a direct probe
     /// This is a fixed value, not affected by cluster size or network type
     pub(crate) ack_timeout: Duration,
@@ -69,12 +75,30 @@ pub struct GossipodConfig {
     /// Base timeout for considering a node suspicious
     /// This value is adjusted based on cluster size
     pub(crate) base_suspicious_timeout: Duration,
-
+    
     /// Type of network the node is operating in (Local, LAN, or WAN)
     /// This affects various timing calculations
     pub(crate) network_type: NetworkType,
+
+    pub(crate) initial_cluster_size: usize,
 }
 
+impl Clone for GossipodConfig {
+    fn clone(&self) -> Self {
+        GossipodConfig {
+            name: self.name.clone(),
+            port: self.port,
+            ip_addrs: self.ip_addrs.clone(),
+            base_probing_interval: self.base_probing_interval,
+            base_gossip_interval: self.base_gossip_interval,
+            ack_timeout: self.ack_timeout,
+            indirect_ack_timeout: self.indirect_ack_timeout,
+            base_suspicious_timeout: self.base_suspicious_timeout,
+            network_type: self.network_type.clone(),
+            initial_cluster_size: self.initial_cluster_size,
+        }
+    }
+}
 
 impl GossipodConfig {
     /// Get the IP addresses.
@@ -94,15 +118,15 @@ impl GossipodConfig {
         self.port
     }
 
-    /// Calculates the probing interval based on cluster size and network type
+    /// Calculates the interval based on cluster size and network type
     ///
-    /// The probing interval increases logarithmically with cluster size to reduce
+    /// The interval increases logarithmically with cluster size to reduce
     /// network load in larger clusters. It's further adjusted based on the network type:
     /// - Local: No additional adjustment
     /// - LAN: 1.5x increase to account for slightly higher latency
     /// - WAN: 3x increase to account for significantly higher latency
-    pub(crate) fn probing_interval(&self, cluster_size: usize) -> Duration {
-        let base_ms = self.base_probing_interval.as_millis() as f64;
+    pub(crate) fn calculate_interval(&self, interval: Duration, cluster_size: usize) -> Duration {
+        let base_ms = interval.as_millis() as f64;
         let log_factor = (cluster_size as f64).ln().max(1.0);
         let interval_ms = base_ms * log_factor;
         let network_factor = match self.network_type {
@@ -142,16 +166,18 @@ impl GossipodConfig {
 
 }
 
-#[derive(Debug, Clone)]
+
 pub struct GossipodConfigBuilder {
     pub(crate) name: Option<String>,
     pub(crate) port: u16,
     pub(crate) ip_addrs: Vec<IpAddr>,
     pub(crate) base_probing_interval: Duration,
+    pub(crate) base_gossip_interval: Duration,
     pub(crate) ack_timeout: Duration,
     pub(crate) indirect_ack_timeout: Duration,
     pub(crate) base_suspicious_timeout: Duration,
     pub(crate) network_type: NetworkType,
+    pub(crate) initial_cluster_size: usize,
 }
 
 impl Default for GossipodConfigBuilder {
@@ -168,6 +194,8 @@ impl Default for GossipodConfigBuilder {
             indirect_ack_timeout: Duration::from_millis(DEFAULT_INDIRECT_ACK_TIMEOUT),
             base_suspicious_timeout: Duration::from_millis(DEFAULT_BASE_SUSPICIOUS_TIMEOUT),
             network_type: NetworkType::default(),
+            base_gossip_interval:  Duration::from_millis(DEFAULT_BASE_GOSSIP_INTERVAL),
+            initial_cluster_size: 1,
         }
     }
 }
@@ -193,6 +221,12 @@ impl GossipodConfigBuilder {
     /// Sets the IP address for the node
     pub fn addr(mut self, addr: impl Into<IpAddress>) -> Self {
         self.ip_addrs = vec![addr.into().0];
+        self
+    }
+
+    /// Sets initial cluster size
+    pub fn cluster_size(mut self, cluster_size: usize) -> Self {
+        self.initial_cluster_size = cluster_size;
         self
     }
 
@@ -249,6 +283,9 @@ impl GossipodConfigBuilder {
         if self.port == 0 {
             anyhow::bail!("bind port is not set");
         }
+        if self.initial_cluster_size == 0 {
+            anyhow::bail!("cluster size must be greater than zero(0)");
+        }
         if self.base_probing_interval.as_millis() == 0 {
             anyhow::bail!("base probing interval is not set");
         }
@@ -278,10 +315,12 @@ impl GossipodConfigBuilder {
             port: self.port,
             ip_addrs: self.ip_addrs,
             base_probing_interval: self.base_probing_interval,
+            base_gossip_interval: self.base_gossip_interval,
             ack_timeout: self.ack_timeout,
             indirect_ack_timeout: self.indirect_ack_timeout,
             base_suspicious_timeout: self.base_suspicious_timeout,
             network_type: self.network_type,
+            initial_cluster_size: self.initial_cluster_size,
         })
     }
 

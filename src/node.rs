@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
 use log::warn;
 use serde::{Serialize, Deserialize};
@@ -280,8 +280,8 @@ impl<M: NodeMetadata> Node<M> {
     }
 
     /// Sets the current node incarnation number
-    pub(crate) fn set_incarnation(&mut self, incarnation: u64) {
-        self.status.incarnation = incarnation;
+    pub(crate) fn set_incarnation(&mut self, new_incarnation: u64) {
+        self.status.incarnation = std::cmp::max(new_incarnation, self.status.incarnation);
     }
 
     /// Returns incarnation number of the node
@@ -444,7 +444,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::{net::Ipv4Addr, time::Duration};
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
     struct DefaultMetadata;

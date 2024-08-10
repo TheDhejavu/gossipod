@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_util::{bytes::BytesMut, codec::{Decoder, Encoder}};
 use core::fmt;
-use std::{net::SocketAddr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{net::SocketAddr, sync::Arc};
 
 use crate::{codec::MessageCodec, node::{Node, NodeMetadata}, transport::{NodeTransport, Transport}, NodeState};
 
@@ -62,7 +62,7 @@ pub(crate) struct SyncReqPayload {
     pub members: Vec<RemoteNode>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Eq, PartialEq, Deserialize)]
 pub(crate) struct RemoteNode {
     pub name: String,
     pub address: SocketAddr,
@@ -87,8 +87,8 @@ pub(crate) enum MessagePayload {
     Broadcast(Broadcast),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Broadcast {
+#[derive(Debug, Clone, Serialize, Eq, PartialEq, Deserialize)]
+pub enum Broadcast {
     Suspect { incarnation: u64, member: String },
     Join { member: RemoteNode  },
     Leave { incarnation: u64, member: String },
@@ -107,7 +107,28 @@ impl Broadcast {
             Broadcast::Alive { .. } => "ALIVE",
         }
     }
+
+    pub(crate) fn priority(&self) -> u8 {
+        match self {
+            Broadcast::Confirm { .. } => 4, 
+            Broadcast::Leave { .. } => 3,  
+            Broadcast::Suspect { .. } => 2,
+            Broadcast::Alive { .. } => 1,   
+            Broadcast::Join { .. } => 0,  
+        }
+    }
+
+    pub fn get_key(&self) -> String {
+        match self {
+            Broadcast::Suspect { member, .. } => member.clone(),
+            Broadcast::Join { member } => member.name.clone(),
+            Broadcast::Leave { member, .. } => member.clone(),
+            Broadcast::Confirm { member, .. } => member.clone(),
+            Broadcast::Alive { member, .. } => member.clone(),
+        }
+    }
 }
+
 
 impl MessagePayload {
     /// Serializes different types of payloads.
