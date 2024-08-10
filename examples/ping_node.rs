@@ -1,9 +1,11 @@
-use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::{net::Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
 
-use gossipod::{config::{GossipodConfigBuilder, NetworkType}, Gossipod};
+use async_trait::async_trait;
+use gossipod::{config::{GossipodConfigBuilder, NetworkType}, DispatchEventHandler, Gossipod, Node, NodeMetadata};
 use log::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
@@ -16,7 +18,7 @@ const TICK_INTERVAL: Duration = Duration::from_secs(3);
 
 struct SwimNode {
     gossipod: Arc<Gossipod>,
-    msg_ch: mpsc::Receiver<Vec<u8>>,
+    receiver: mpsc::Receiver<Vec<u8>>,
     config: gossipod::config::GossipodConfig,
 }
 
@@ -25,6 +27,42 @@ struct Message {
     key: String,
     value: u64,
 }
+
+
+struct EventHandler{
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
+impl EventHandler {
+    fn new(sender: mpsc::Sender<Vec<u8>>) -> Self{
+        Self { sender }
+    }
+}
+
+#[async_trait]
+impl<M: NodeMetadata> DispatchEventHandler<M> for EventHandler {
+    async fn notify_dead(&self, node: &Node<M>) -> Result<()> {
+        info!("Node {} detected as dead", node.name);
+        Ok(())
+    }
+
+    async fn notify_leave(&self, node: &Node<M>) -> Result<()> {
+        info!("Node {} is leaving the cluster", node.name);
+        Ok(())
+    }
+
+    async fn notify_join(&self, node: &Node<M>) -> Result<()> {
+        info!("Node {} has joined the cluster", node.name);
+        Ok(())
+    }
+
+    async fn notify_message(&self, from: SocketAddr, message: Vec<u8>) -> Result<()> {
+        info!("Received message from {}: {:?}", from, message);
+        self.sender.send(message).await?;
+        Ok(())
+    }
+}
+
 
 impl SwimNode {
     async fn new(args: &Args) -> Result<Self> {
@@ -40,15 +78,18 @@ impl SwimNode {
             .build()
             .await?;
 
-        let gossipod = Arc::new(Gossipod::new(config.clone())
-            .await
-            .context("Failed to initialize Gossipod")?);
+        
+        let (sender, receiver) = mpsc::channel(1000);
+        let dispatch_event_handler = EventHandler::new(sender);
 
-        let msg_ch = gossipod.with_receiver(100).await;
+        let gossipod = Gossipod::with_event_handler(config.clone(), Arc::new(dispatch_event_handler) )
+        .await
+        .context("Failed to initialize Gossipod with custom metadata")?;
 
+       
         Ok(SwimNode {
-            gossipod,
-            msg_ch,
+            gossipod: gossipod.into(),
+            receiver,
             config,
         })
     }
@@ -80,7 +121,7 @@ impl SwimNode {
                 _ = ticker.tick() => {
                     self.send_ping_to_all(&mut counter).await;
                 }
-                Some(data) = self.msg_ch.recv() => {
+                Some(data) = self.receiver.recv() => {
                     self.handle_incoming_message(data, &mut counter).await;
                 }
                 _ = tokio::signal::ctrl_c() => {

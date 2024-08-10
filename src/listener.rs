@@ -104,7 +104,7 @@ impl<M: NodeMetadata> EventListener<M> {
     /// to the appropriate methods in the Gossipod instance.
     async fn process_tcp_stream(gossipod: Gossipod<M>, stream: TcpStream, message: Message, addr: SocketAddr) -> Result<()> {
         match message.msg_type {
-            MessageType::AppMsg => gossipod.handle_app_msg(message.payload).await,
+            MessageType::AppMsg => gossipod.handle_app_msg(message.sender, message.payload).await,
             _ => {
                 warn!("[ERR] Unexpected message type {} for TCP from {}", message.msg_type, addr);
                 Ok(())

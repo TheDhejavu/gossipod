@@ -2,6 +2,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use gossipod::{DispatchEventHandler, Node, NodeMetadata};
 use gossipod::{config::{GossipodConfigBuilder, NetworkType}, Gossipod};
 use log::*;
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,41 @@ struct SwimNode {
     config: gossipod::config::GossipodConfig,
 }
 
+struct EventHandler{
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
+impl EventHandler {
+    fn new(sender: mpsc::Sender<Vec<u8>>) -> Self{
+        Self { sender }
+    }
+}
+
+#[async_trait]
+impl<M: NodeMetadata> DispatchEventHandler<M> for EventHandler {
+    async fn notify_dead(&self, node: &Node<M>) -> Result<()> {
+        info!("Node {} detected as dead", node.name);
+        Ok(())
+    }
+
+    async fn notify_leave(&self, node: &Node<M>) -> Result<()> {
+        info!("Node {} is leaving the cluster", node.name);
+        Ok(())
+    }
+
+    async fn notify_join(&self, node: &Node<M>) -> Result<()> {
+        info!("Node {} has joined the cluster", node.name);
+        Ok(())
+    }
+
+    async fn notify_message(&self, from: SocketAddr, message: Vec<u8>) -> Result<()> {
+        info!("Received message from {}: {:?}", from, message);
+        self.sender.send(message).await?;
+        Ok(())
+    }
+}
+
+
 impl SwimNode {
     async fn new(args: &Args) -> Result<Self> {
         let config = GossipodConfigBuilder::new()
@@ -54,14 +91,16 @@ impl SwimNode {
             .build()
             .await?;
 
-        let gossipod = Arc::new(Gossipod::new(config.clone())
+        let (sender, receiver) = mpsc::channel(1000);
+        let dispatch_event_handler = EventHandler::new(sender);
+    
+        let gossipod = Gossipod::with_event_handler(config.clone(), Arc::new(dispatch_event_handler) )
             .await
-            .context("Failed to initialize Gossipod")?);
-
-        let receiver = gossipod.with_receiver(100).await;
-
+            .context("Failed to initialize Gossipod with custom metadata")?;
+    
+           
         Ok(SwimNode {
-            gossipod,
+            gossipod: gossipod.into(),
             receiver,
             config,
         })

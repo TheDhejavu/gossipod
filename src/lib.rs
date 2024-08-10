@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
 use codec::MessageCodec;
 pub use broadcast_queue::{BroadcastQueue, DefaultBroadcastQueue};
+pub use  dispatch_event_handler::DispatchEventHandler;
 use rand::{thread_rng, Rng};
 use config::{BROADCAST_FANOUT, INDIRECT_REQ, MAX_UDP_PACKET_SIZE};
 use event_scheduler::{EventState, EventType};
@@ -10,7 +11,6 @@ use log::*;
 use members::MergeAction;
 use message::{AckPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
 pub use node::{DefaultMetadata, NodeMetadata};
-use notifer::Notifier;
 use tokio::sync::{broadcast, mpsc};
 use parking_lot::RwLock;
 use tokio::time::{self, Instant};
@@ -27,11 +27,11 @@ use crate::{
     listener::EventListener,
     members::Membership,
     message::{Message, NetSvc, RemoteNode},
-    node::Node,
     backoff::BackOff,
     state::NodeState,
     transport::Transport,
 };
+pub use node::Node;
 
 mod transport;
 mod message;
@@ -48,6 +48,7 @@ mod notifer;
 mod utils;
 mod broadcast_queue;
 mod mock_transport;
+mod dispatch_event_handler;
 
 // SWIM Protocol Implementation for GOSSIPOD
 
@@ -150,14 +151,14 @@ where
     /// Manager for handling and creating of events
     event_scheduler: EventScheduler,
 
-    notifier: Arc<Notifier>,
-
     /// Network service for handling communication
     pub(crate) net_svc: NetSvc,
 
     // broadcasts represents outbound messages to peers
     // when it's not set, it defaults to DefaultBroadcastQueue
     pub(crate) broadcasts: Arc<dyn BroadcastQueue>,
+
+    pub(crate) dispatch_event_handler: Option<Arc<dyn DispatchEventHandler<M>>>
 }
 
 impl<M> Clone for Gossipod<M>
@@ -175,7 +176,21 @@ impl Gossipod {
     /// Creates a new instance of Gossipod with the default metadata.
     pub async fn new(config: GossipodConfig) -> Result<Self> {
         let queue = DefaultBroadcastQueue::new(config.initial_cluster_size);
-        Gossipod::with_custom(config, DefaultMetadata::default(), Arc::new(queue)).await
+        Gossipod::with_custom(config, DefaultMetadata::default(), Arc::new(queue), None).await
+    }
+
+    /// Creates a new instance of Gossipod with the default metadata and custom event handler.
+    pub async fn with_event_handler(
+        config: GossipodConfig,  
+        dispatch_event_handler: Arc<dyn DispatchEventHandler<DefaultMetadata>>,
+    ) -> Result<Self> {
+        let queue = DefaultBroadcastQueue::new(config.initial_cluster_size);
+        Gossipod::with_custom(
+            config, 
+            DefaultMetadata::default(), 
+            Arc::new(queue), 
+            Some(dispatch_event_handler),
+        ).await
     }
 }
 
@@ -184,7 +199,12 @@ where
     M: NodeMetadata + Send + Sync,
 {
     /// Creates a new instance of Gossipod with the provided metadata.
-    pub async fn with_custom(config: GossipodConfig, metadata: M, broadcasts: Arc<dyn BroadcastQueue> ) -> Result<Self> {
+    pub async fn with_custom(
+        config: GossipodConfig, 
+        metadata: M, 
+        broadcasts: Arc<dyn BroadcastQueue>,
+        dispatch_event_handler: Option<Arc<dyn DispatchEventHandler<M>>>,
+     ) -> Result<Self> {
         env_logger::Builder::new()
             .filter_level(::log::LevelFilter::Info) 
             .filter_level(::log::LevelFilter::Debug)
@@ -212,9 +232,9 @@ where
                 transport: shared_transport,
                 sequence_number: AtomicU64::new(0),
                 incarnation: AtomicU64::new(0),
-                notifier: Arc::new(Notifier::new()),
                 event_scheduler: EventScheduler::new(),
                 broadcasts,
+                dispatch_event_handler,
             })
         };
 
@@ -679,11 +699,6 @@ where
         self.inner.incarnation.load(Ordering::SeqCst)
     }
 
-    // set message channel reciever for your application
-    pub async fn with_receiver(&self, buffer: usize) -> mpsc::Receiver<Vec<u8>> {
-        self.inner.notifier.with_receiver(buffer).await
-    }
-
     // Send user application-specific messages to target
     pub async fn send(&self, target: SocketAddr, msg: &[u8]) -> Result<()> {
         let local_node = self.get_local_node().await?;
@@ -691,12 +706,6 @@ where
 
         self.inner.net_svc.message_target(target, local_addr, msg).await?;
         Ok(())
-    }
-
-    // checks if server is running and checks if your have receiver initialized for 
-    // accepting app-specific message
-    pub async fn is_ready(&self) -> bool {
-        self.inner.notifier.is_initialized().await && self.is_running().await
     }
 
     /// Gossipod PROBE - Probes randomly selected nodes
@@ -1197,15 +1206,17 @@ where
        Ok(())
     }
     
-    async fn handle_app_msg(&self, message_payload: MessagePayload) -> Result<()> {
+    async fn handle_app_msg(&self, from: SocketAddr, message_payload: MessagePayload) -> Result<()> {
         match message_payload {
             MessagePayload::AppMsg(payload) => {
-                if !self.inner.notifier.is_initialized().await {
-                    warn!("New message but no receiver is set, ignoring app message.");
+                if self.inner.dispatch_event_handler.is_none() {
+                    warn!("[ERR] No event event handler, ignoring app message.");
                     return Ok(());
                 }
 
-                self.inner.notifier.notify(payload.data).await?;
+                if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
+                    dispatch_handler.notify_message(from, payload.data).await?;
+                }
             }
             _ => {}
         }
@@ -1424,7 +1435,11 @@ where
                 match merge_result.action {
                     MergeAction::Added => {
                         info!("Added new node {} to the cluster", member.name);
-                        self.broadcast_join(new_node).await?;
+                        self.broadcast_join(new_node.clone()).await?;
+
+                        if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
+                            dispatch_handler.notify_join(&new_node).await?;
+                        }
                     },
                     MergeAction::Updated => {
                         info!("Updated existing node {} in the cluster", member.name);
@@ -1482,6 +1497,9 @@ where
                                 member: member.to_string(),
                             };
                             self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
+                            if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
+                                dispatch_handler.notify_leave(&leave_node).await?;
+                            }
                         },
                         MergeAction::Unchanged => {
                             debug!("No changes for node {} in the cluster", node.name);
@@ -1523,6 +1541,9 @@ where
                                 member: member.to_string(),
                             };
                             self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
+                            if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
+                                dispatch_handler.notify_dead(&confim_node).await?;
+                            }
                         },
                         MergeAction::Unchanged => {
                             debug!("No changes for node {} in the cluster", node.name);
@@ -1821,9 +1842,9 @@ mod tests {
                 sequence_number: AtomicU64::new(0),
                 incarnation: AtomicU64::new(10),
                 event_scheduler: EventScheduler::new(),
-                notifier: Arc::new(Notifier::new()),
                 net_svc: NetSvc::new(mock_transport.clone()),
-                broadcasts: Arc::new(DefaultBroadcastQueue::new(1))
+                broadcasts: Arc::new(DefaultBroadcastQueue::new(1)),
+                dispatch_event_handler: None,
             }),
         };
 
@@ -1912,9 +1933,9 @@ mod tests {
                 sequence_number: AtomicU64::new(0),
                 incarnation: AtomicU64::new(10),
                 event_scheduler: EventScheduler::new(),
-                notifier: Arc::new(Notifier::new()),
                 net_svc: NetSvc::new(mock_transport.clone()),
-                broadcasts: Arc::new(DefaultBroadcastQueue::new(1))
+                broadcasts: Arc::new(DefaultBroadcastQueue::new(1)),
+                dispatch_event_handler: None,
             }),
         };
 
