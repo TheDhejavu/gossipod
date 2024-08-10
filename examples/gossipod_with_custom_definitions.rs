@@ -1,6 +1,6 @@
-use std::{net::{Ipv4Addr, SocketAddr}, time::Duration};
+use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc, time::Duration};
 use anyhow::{Context as _, Result};
-use gossipod::{config::{GossipodConfigBuilder, NetworkType}, Gossipod, NodeMetadata};
+use gossipod::{config::{GossipodConfigBuilder, NetworkType}, DefaultBroadcastQueue, Gossipod, NodeMetadata};
 use log::*;
 use serde::{Deserialize, Serialize};
 use tokio::time;
@@ -47,12 +47,16 @@ async fn main() -> Result<()> {
         .await?;
 
     info!("Initializing Gossipod with custom metadata");
+    
+    // Use Custom Metadata
     let metadata = Metadata { 
         region: "aws-west-1".to_string(),
         datacenter: "dc1".to_string(),
     };
 
-    let gossipod = Gossipod::with_metadata(config, metadata)
+    // Use Default broadcast Queue
+    let broadcast_queue =  Arc::new(DefaultBroadcastQueue::new(1));
+    let gossipod = Gossipod::with_custom(config, metadata, broadcast_queue)
         .await
         .context("Failed to initialize Gossipod with custom metadata")?;
 

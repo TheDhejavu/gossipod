@@ -1,11 +1,13 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use dashmap::DashMap;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
 use crate::node::{Node, NodeMetadata, NodePriority};
 use crate::state::NodeState;
@@ -13,8 +15,9 @@ use crate::state::NodeState;
 #[derive(Debug)]
 pub(crate) struct Membership<M: NodeMetadata> {
     nodes: Arc<DashMap<String, Node<M>>>,
-    current_index: AtomicUsize,
     nodes_priority_queue: Arc<RwLock<BinaryHeap<Reverse<NodePriority<M>>>>>,
+    gossip_index: AtomicUsize,
+    probe_index: AtomicUsize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -39,7 +42,8 @@ impl<M: NodeMetadata> Membership<M> {
         Self {
             nodes: Arc::new(DashMap::new()),
             nodes_priority_queue: Arc::new(RwLock::new(BinaryHeap::new())),
-            current_index: AtomicUsize::new(0),
+            gossip_index: AtomicUsize::new(0),
+            probe_index: AtomicUsize::new(0),
         }
     }
 
@@ -97,26 +101,43 @@ impl<M: NodeMetadata> Membership<M> {
     }
 
     /// Selects the next node for gossip using a round-robin approach, with an optional exclusion predicate.
-    pub(crate) fn next_node<F>(&self, exclude: Option<F>) -> Result<Option<Node<M>>>
+    pub(crate) fn next_gossip_node<F>(&self, exclude: Option<F>) -> Result<Option<Node<M>>>
     where
         F: Fn(&Node<M>) -> bool,
     {
-        let mut active_nodes: Vec<_> = self.nodes.iter()
+        let eligible_nodes: Vec<_> = self.nodes.iter()
             .filter(|r| exclude.as_ref().map_or(true, |f| !f(r.value())))
             .map(|r| r.value().clone())
             .collect();
-        
-        if active_nodes.is_empty() {
+
+        if eligible_nodes.is_empty() {
             return Ok(None);
         }
 
-        active_nodes.sort_by_key(|node| node.name.clone());
-        let index = self.current_index.fetch_add(1, Ordering::Relaxed) % active_nodes.len();
-        Ok(Some(active_nodes[index].clone()))
+        let index = self.gossip_index.fetch_add(1, Ordering::Relaxed) % eligible_nodes.len();
+        Ok(Some(eligible_nodes[index].clone()))
     }
 
-    /// Selects a specified number of random nodes from the membership list, with an optional exclusion predicate.
-    pub(crate) fn select_random_nodes<F>(&self, count: usize, exclude: Option<F>) -> Result<Vec<Node<M>>>
+    /// Selects the next node for probe using a round-robin approach, with an optional exclusion predicate.
+    pub(crate) fn next_probe_node<F>(&self, exclude: Option<F>) -> Result<Option<Node<M>>>
+    where
+        F: Fn(&Node<M>) -> bool,
+    {
+        let eligible_nodes: Vec<_> = self.nodes.iter()
+            .filter(|r| exclude.as_ref().map_or(true, |f| !f(r.value())))
+            .map(|r| r.value().clone())
+            .collect();
+
+        if eligible_nodes.is_empty() {
+            return Ok(None);
+        }
+
+        let index = self.probe_index.fetch_add(1, Ordering::Relaxed) % eligible_nodes.len();
+        Ok(Some(eligible_nodes[index].clone()))
+    }
+    
+    /// Selects a specified number of random nodes for gossip from the membership list, with an optional exclusion predicate.
+    pub(crate) fn select_random_gossip_nodes<F>(&self, count: usize, exclude: Option<F>) -> Result<Vec<Node<M>>>
     where
         F: Fn(&Node<M>) -> bool,
     {
@@ -129,22 +150,26 @@ impl<M: NodeMetadata> Membership<M> {
             return Ok(Vec::new());
         }
 
-        let mut selected = HashSet::new();
-        let mut result = Vec::new();
-        let max_attempts = eligible_nodes.len() * 2;
+        let mut rng = thread_rng();
+        Ok(eligible_nodes.choose_multiple(&mut rng, count).cloned().collect())
+    }
 
-        for _ in 0..max_attempts {
-            if selected.len() >= count {
-                break;
-            }
-            let index = self.current_index.fetch_add(1, Ordering::Relaxed) % eligible_nodes.len();
-            let node = &eligible_nodes[index];
-            if selected.insert(node.name.clone()) {
-                result.push(node.clone());
-            }
+    /// Selects a specified number of random nodes for probe from the membership list, with an optional exclusion predicate.
+    pub(crate) fn select_random_probe_nodes<F>(&self, count: usize, exclude: Option<F>) -> Result<Vec<Node<M>>>
+    where
+        F: Fn(&Node<M>) -> bool,
+    {
+        let eligible_nodes: Vec<_> = self.nodes.iter()
+            .filter(|r| exclude.as_ref().map_or(true, |f| !f(r.value())))
+            .map(|r| r.value().clone())
+            .collect();
+
+        if eligible_nodes.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(result)
+        let mut rng = thread_rng();
+        Ok(eligible_nodes.choose_multiple(&mut rng, count).cloned().collect())
     }
 
     /// Returns the number of active nodes in the membership list.
@@ -179,7 +204,8 @@ impl<M: NodeMetadata> Membership<M> {
             let new_state = existing_node.state();
 
             if changed && matches!(new_state, NodeState::Leaving | NodeState::Left) {
-                drop(entry);  // Release the lock before removing
+                drop(entry);
+                
                 self.nodes.remove(&other_node.name);
                 let mut priority_queue = self.nodes_priority_queue.write();
                 priority_queue.retain(|Reverse(np)| np.name != other_node.name);
@@ -222,7 +248,7 @@ impl<M: NodeMetadata> Membership<M> {
 
 pub struct LeastRecentlyPiggybackedIter<'a, M: NodeMetadata> {
     membership: &'a Membership<M>,
-    piggybacked_state: HashSet<String>,
+    piggybacked_state: std::collections::HashSet<String>,
     iteration_start_time: SystemTime,
 }
 
@@ -230,7 +256,7 @@ impl<'a, M: NodeMetadata> LeastRecentlyPiggybackedIter<'a, M> {
     fn new(membership: &'a Membership<M>) -> Self {
         Self {
             membership,
-            piggybacked_state: HashSet::new(),
+            piggybacked_state: std::collections::HashSet::new(),
             iteration_start_time: SystemTime::now(),
         }
     }
@@ -273,7 +299,6 @@ impl<'a, M: NodeMetadata> Iterator for LeastRecentlyPiggybackedIter<'a, M> {
         None
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};

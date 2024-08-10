@@ -11,7 +11,7 @@ use crate::config::{DEFAULT_CHANNEL_BUFFER_SIZE, MAX_UDP_PACKET_SIZE};
 use crate::node::Node;
 use crate::transport::{NetworkTcpStream, NetworkUdpSocket, NodeTransport, TransportChannel};
 use crate::DefaultMetadata;
-use crate::{state::NodeState};
+use crate::state::NodeState;
 
 
 pub(crate) struct MockTransport {

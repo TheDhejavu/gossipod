@@ -227,12 +227,6 @@ impl MessageCodec {
     /// Decodes a PingPayload from BytesMut.
     ///
     /// This method deserializes a PingPayload struct from the BytesMut buffer.
-    ///
-    /// # Arguments
-    /// * `src` - The source BytesMut buffer to read from
-    ///
-    /// # Returns
-    /// * `Result<PingPayload>` - The decoded PingPayload on success, or an error if decoding fails
     pub(crate) fn decode_ping_payload(src: &mut BytesMut) -> Result<PingPayload> {
         let sequence_number = Self::decode_u64(src)?;
         let piggybacked_updates = Self::decode_vec(Self::decode_remote_node, src)?;
@@ -242,13 +236,6 @@ impl MessageCodec {
     /// Encodes a PingReqPayload into BytesMut.
     ///
     /// This method serializes a PingReqPayload struct into the BytesMut buffer.
-    ///
-    /// # Arguments
-    /// * `payload` - The PingReqPayload to encode
-    /// * `dst` - The destination BytesMut buffer to write into
-    ///
-    /// # Returns
-    /// * `Result<()>` - Ok if encoding succeeds
     pub(crate) fn encode_ping_req_payload(payload: &PingReqPayload, dst: &mut BytesMut) -> Result<()> {
         Self::encode_socket_addr(&payload.target, dst)?;
         Self::encode_u64(payload.sequence_number, dst)?;
@@ -261,12 +248,6 @@ impl MessageCodec {
     /// Decodes a PingReqPayload from BytesMut.
     ///
     /// This method deserializes a PingReqPayload struct from the BytesMut buffer.
-    ///
-    /// # Arguments
-    /// * `src` - The source BytesMut buffer to read from
-    ///
-    /// # Returns
-    /// * `Result<PingReqPayload>` - The decoded PingReqPayload on success, or an error if decoding fails
     pub(crate) fn decode_ping_req_payload(src: &mut BytesMut) -> Result<PingReqPayload> {
         let target = Self::decode_socket_addr(src)?;
         let sequence_number = Self::decode_u64(src)?;
@@ -490,7 +471,7 @@ impl Decoder for MessageCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{NoAckPayload, PingPayload};
+    use crate::message::NoAckPayload;
     use serde::{Serialize, Deserialize};
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
