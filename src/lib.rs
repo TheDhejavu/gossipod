@@ -1851,6 +1851,8 @@ mod tests {
 
         // Handle the SUSPECT broadcast
         gossipod.handle_broadcast(suspect_message).await?;
+        
+        gossipod.gossip().await?;
 
         // Check that an ALIVE broadcast was sent to refute the suspicion
         let udp_messages = mock_transport.get_udp_messages().await;
