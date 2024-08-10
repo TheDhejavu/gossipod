@@ -1367,7 +1367,12 @@ where
                 error!("Unable to merge node {}: {}", dead_node.name, e);
             },
         }
+       
+        if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
+            dispatch_handler.notify_dead(&node).await?;
+        }
         self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)
+
     }
 
     async fn set_local_node_liveness(&self) -> Result<()> {
