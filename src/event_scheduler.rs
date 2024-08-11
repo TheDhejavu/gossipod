@@ -66,7 +66,7 @@ pub(crate) struct EventScheduler {
 }
 
 impl EventScheduler {
-    // Create new EventScheduler Instance
+    // Create new [`EventScheduler`] Instance
     pub(crate) fn new() -> Self {
         EventScheduler {
             events: Arc::new(RwLock::new(BinaryHeap::new())),

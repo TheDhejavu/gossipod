@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -136,7 +136,8 @@ impl<M: NodeMetadata> Membership<M> {
         Ok(Some(eligible_nodes[index].clone()))
     }
     
-    /// Selects a specified number of random nodes for gossip from the membership list, with an optional exclusion predicate.
+   /// Selects a specified number of nodes for gossip from the membership list using round-robin,
+    /// with an optional exclusion predicate.
     pub(crate) fn select_random_gossip_nodes<F>(&self, count: usize, exclude: Option<F>) -> Result<Vec<Node<M>>>
     where
         F: Fn(&Node<M>) -> bool,
@@ -146,15 +147,26 @@ impl<M: NodeMetadata> Membership<M> {
             .map(|r| r.value().clone())
             .collect();
 
-        if eligible_nodes.is_empty() {
-            return Ok(Vec::new());
+        let mut selected = HashSet::new();
+        let mut result = Vec::new();
+        let max_attempts = eligible_nodes.len() * 2;
+    
+        for _ in 0..max_attempts {
+            if selected.len() >= count {
+                break;
+            }
+            let index = self.gossip_index.fetch_add(1, Ordering::Relaxed) % eligible_nodes.len();
+            let node = &eligible_nodes[index];
+            if selected.insert(node.name.clone()) {
+                result.push(node.clone());
+            }
         }
-
-        let mut rng = thread_rng();
-        Ok(eligible_nodes.choose_multiple(&mut rng, count).cloned().collect())
+    
+        Ok(result)
     }
 
-    /// Selects a specified number of random nodes for probe from the membership list, with an optional exclusion predicate.
+    /// Selects a specified number of nodes for probe from the membership list using round-robin,
+    /// with an optional exclusion predicate.
     pub(crate) fn select_random_probe_nodes<F>(&self, count: usize, exclude: Option<F>) -> Result<Vec<Node<M>>>
     where
         F: Fn(&Node<M>) -> bool,
@@ -164,12 +176,26 @@ impl<M: NodeMetadata> Membership<M> {
             .map(|r| r.value().clone())
             .collect();
 
-        if eligible_nodes.is_empty() {
-            return Ok(Vec::new());
+            if eligible_nodes.is_empty() {
+                return Ok(Vec::new());
+            }
+    
+        let mut selected = HashSet::new();
+        let mut result = Vec::new();
+        let max_attempts = eligible_nodes.len() * 2;
+    
+        for _ in 0..max_attempts {
+            if selected.len() >= count {
+                break;
+            }
+            let index = self.probe_index.fetch_add(1, Ordering::Relaxed) % eligible_nodes.len();
+            let node = &eligible_nodes[index];
+            if selected.insert(node.name.clone()) {
+                result.push(node.clone());
+            }
         }
-
-        let mut rng = thread_rng();
-        Ok(eligible_nodes.choose_multiple(&mut rng, count).cloned().collect())
+    
+        Ok(result)
     }
 
     /// Returns the number of active nodes in the membership list.

@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,22 +55,22 @@ impl EventHandler {
 
 #[async_trait]
 impl<M: NodeMetadata> DispatchEventHandler<M> for EventHandler {
-    async fn notify_dead(&self, node: &Node<M>) -> Result<()> {
+    async fn notify_dead(&self, node: &Node<M>) -> Result<(), Box<dyn Error + Send + Sync>>  {
         info!("Node {} detected as dead", node.name);
         Ok(())
     }
 
-    async fn notify_leave(&self, node: &Node<M>) -> Result<()> {
+    async fn notify_leave(&self, node: &Node<M>) -> Result<(), Box<dyn Error + Send + Sync>>  {
         info!("Node {} is leaving the cluster", node.name);
         Ok(())
     }
 
-    async fn notify_join(&self, node: &Node<M>) -> Result<()> {
+    async fn notify_join(&self, node: &Node<M>) -> Result<(), Box<dyn Error + Send + Sync>>  {
         info!("Node {} has joined the cluster", node.name);
         Ok(())
     }
 
-    async fn notify_message(&self, from: SocketAddr, message: Vec<u8>) -> Result<()> {
+    async fn notify_message(&self, from: SocketAddr, message: Vec<u8>) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("Received message from {}: {:?}", from, message);
         self.sender.send(message).await?;
         Ok(())
@@ -173,6 +174,10 @@ impl SwimNode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    env_logger::Builder::new()
+    .filter_level(::log::LevelFilter::Info) 
+    .filter_level(::log::LevelFilter::Debug)
+    .init();
 
     let mut node = SwimNode::new(&args).await?;
     node.start().await?;

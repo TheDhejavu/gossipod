@@ -1,12 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
-use std::sync::Arc;
 use gethostname::gethostname;
 use std::time::Duration;
 
 use anyhow::Result;
 use crate::ip_addr::IpAddress;
-use crate::broadcast_queue::{DefaultBroadcastQueue, BroadcastQueue};
 
 // Default configuration constants
 pub(crate) const DEFAULT_IP_ADDR: &str = "127.0.0.1";
@@ -17,9 +15,8 @@ pub(crate) const DEFAULT_BASE_GOSSIP_INTERVAL: u64 = 1_000; // 1 second base int
 pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 500; // 500 milliseconds
 pub(crate) const DEFAULT_INDIRECT_ACK_TIMEOUT: u64 = 1_000; // 1 second
 pub(crate) const DEFAULT_BASE_SUSPICIOUS_TIMEOUT: u64 = 5_000; // 5 seconds
-pub(crate) const DEFAULT_MESSAGE_BUFFER_SIZE: usize = 1_024; 
 pub(crate) const DEFAULT_TRANSPORT_TIMEOUT: u64 = 5_000;
-pub(crate) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 100;
+pub(crate) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 1_000;
 pub(crate) const MAX_RETRY_DELAY: u64 = 60; // in secs
 pub(crate) const MAX_UDP_PACKET_SIZE: usize = 1400; 
 pub(crate) const BROADCAST_FANOUT: usize = 2; 
@@ -54,8 +51,8 @@ pub struct GossipodConfig {
     /// Port number on which the node will listen for gossip messages
     pub(crate) port: u16,
 
-    /// List of IP addresses the node will bind to
-    pub(crate) ip_addrs: Vec<IpAddr>,
+    /// IP Address the node will bind to
+    pub(crate) ip_addr: IpAddr,
 
     /// Base interval for probing other nodes in the cluster
     /// This value is adjusted based on cluster size and network type
@@ -94,7 +91,7 @@ impl Clone for GossipodConfig {
         GossipodConfig {
             name: self.name.clone(),
             port: self.port,
-            ip_addrs: self.ip_addrs.clone(),
+            ip_addr: self.ip_addr.clone(),
             base_probing_interval: self.base_probing_interval,
             base_gossip_interval: self.base_gossip_interval,
             ack_timeout: self.ack_timeout,
@@ -108,13 +105,8 @@ impl Clone for GossipodConfig {
 }
 
 impl GossipodConfig {
-    /// Get the IP addresses.
-    pub fn ip_addrs(&self) -> &[IpAddr] {
-        &self.ip_addrs
-    }
-
     pub fn addr(&self) -> IpAddr {
-        self.ip_addrs[0]
+        self.ip_addr
     }
 
     pub fn name(&self) -> String {
@@ -183,7 +175,7 @@ impl GossipodConfig {
 pub struct GossipodConfigBuilder {
     pub(crate) name: Option<String>,
     pub(crate) port: u16,
-    pub(crate) ip_addrs: Vec<IpAddr>,
+    pub(crate) ip_addr: IpAddr,
     pub(crate) base_probing_interval: Duration,
     pub(crate) base_gossip_interval: Duration,
     pub(crate) ack_timeout: Duration,
@@ -202,7 +194,7 @@ impl Default for GossipodConfigBuilder {
         Self {
             name: None,
             port: DEFAULT_PORT,
-            ip_addrs: vec![ip_addr],
+            ip_addr: ip_addr,
             base_probing_interval: Duration::from_millis(DEFAULT_BASE_PROBING_INTERVAL),
             ack_timeout: Duration::from_millis(DEFAULT_ACK_TIMEOUT),
             indirect_ack_timeout: Duration::from_millis(DEFAULT_INDIRECT_ACK_TIMEOUT),
@@ -216,7 +208,7 @@ impl Default for GossipodConfigBuilder {
 }
 
 impl GossipodConfigBuilder {
-    /// Creates a new GossipodConfigBuilder with default values
+    /// Creates a new [`GossipodConfigBuilder`] with default values
     pub fn new() -> Self {
         Self::default()
     }
@@ -235,7 +227,7 @@ impl GossipodConfigBuilder {
 
     /// Sets the IP address for the node
     pub fn addr(mut self, addr: impl Into<IpAddress>) -> Self {
-        self.ip_addrs = vec![addr.into().0];
+        self.ip_addr = addr.into().0;
         self
     }
 
@@ -298,7 +290,7 @@ impl GossipodConfigBuilder {
     ///
     /// Checks that all necessary fields are set and have non-zero values where appropriate.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.ip_addrs.is_empty() {
+        if self.ip_addr.to_string() == "" {
             anyhow::bail!("bind address is not set");
         }
         if self.port == 0 {
@@ -337,7 +329,7 @@ impl GossipodConfigBuilder {
         Ok(GossipodConfig {
             name: self.name.unwrap(),
             port: self.port,
-            ip_addrs: self.ip_addrs,
+            ip_addr: self.ip_addr,
             base_probing_interval: self.base_probing_interval,
             base_gossip_interval: self.base_gossip_interval,
             ack_timeout: self.ack_timeout,

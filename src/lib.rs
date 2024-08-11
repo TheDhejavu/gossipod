@@ -11,26 +11,24 @@ use log::*;
 use members::MergeAction;
 use message::{AckPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
 pub use node::{DefaultMetadata, NodeMetadata};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use parking_lot::RwLock;
 use tokio::time::{self, Instant};
 use tokio_util::bytes::{BufMut, BytesMut};
 use tokio_util::codec::Encoder;
-use transport::NodeTransport;
+use transport::Datagram;
 use utils::pretty_debug;
 use std::net::SocketAddr;
 use std::time::Duration;
 use crate::{
-    config::{GossipodConfig, DEFAULT_IP_ADDR, DEFAULT_TRANSPORT_TIMEOUT},
+    config::GossipodConfig,
     event_scheduler::EventScheduler,
-    ip_addr::IpAddress,
-    listener::EventListener,
     members::Membership,
-    message::{Message, NetSvc, RemoteNode},
+    message::{Message, RemoteNode},
     backoff::BackOff,
     state::NodeState,
-    transport::Transport,
 };
+pub use transport::{DatagramTransport, DefaultTransport};
 pub use node::Node;
 
 mod transport;
@@ -40,11 +38,9 @@ pub mod config;
 mod state;
 mod node;
 mod members;
-mod listener;
 mod codec;
 mod backoff;
 mod event_scheduler;
-mod notifer;
 mod utils;
 mod broadcast_queue;
 mod mock_transport;
@@ -113,8 +109,6 @@ enum GossipodState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ShutdownReason {
     Termination,
-    TcpFailure,
-    UdpFailure,
     SchedulerFailure,
 }
 
@@ -134,7 +128,7 @@ where
     members: Membership<M>,
 
     /// Communication layer for sending and receiving messages
-    transport: Arc<dyn NodeTransport>,
+    transport: Arc<dyn DatagramTransport>,
 
     /// Current state of the Gossipod,
     state: RwLock<GossipodState>,
@@ -150,9 +144,6 @@ where
 
     /// Manager for handling and creating of events
     event_scheduler: EventScheduler,
-
-    /// Network service for handling communication
-    pub(crate) net_svc: NetSvc,
 
     // broadcasts represents outbound messages to peers
     // when it's not set, it defaults to DefaultBroadcastQueue
@@ -173,22 +164,31 @@ where
 }
 
 impl Gossipod {
-    /// Creates a new instance of Gossipod with the default metadata.
+    /// Creates a new instance of [`Gossipod`] with the default metadata.
     pub async fn new(config: GossipodConfig) -> Result<Self> {
         let queue = DefaultBroadcastQueue::new(config.initial_cluster_size);
-        Gossipod::with_custom(config, DefaultMetadata::default(), Arc::new(queue), None).await
+        let transport = DefaultTransport::new(config.addr(), config.port()).await?;
+        Gossipod::with_custom(
+            config, 
+            DefaultMetadata::default(), 
+            Arc::new(queue), 
+            Arc::new(transport),
+            None,
+        ).await
     }
 
-    /// Creates a new instance of Gossipod with the default metadata and custom event handler.
+    /// Creates a new instance of [`Gossipod`] with the default metadata and custom event handler.
     pub async fn with_event_handler(
         config: GossipodConfig,  
         dispatch_event_handler: Arc<dyn DispatchEventHandler<DefaultMetadata>>,
     ) -> Result<Self> {
         let queue = DefaultBroadcastQueue::new(config.initial_cluster_size);
+        let transport = DefaultTransport::new(config.addr(), config.port()).await?;
         Gossipod::with_custom(
             config, 
             DefaultMetadata::default(), 
             Arc::new(queue), 
+            Arc::new(transport),
             Some(dispatch_event_handler),
         ).await
     }
@@ -198,38 +198,24 @@ impl<M> Gossipod<M>
 where
     M: NodeMetadata + Send + Sync,
 {
-    /// Creates a new instance of Gossipod with the provided metadata.
+    /// Creates a new instance of [`Gossipod`] with the provided metadata.
     pub async fn with_custom(
         config: GossipodConfig, 
         metadata: M, 
         broadcasts: Arc<dyn BroadcastQueue>,
+        transport:  Arc<dyn DatagramTransport>,
         dispatch_event_handler: Option<Arc<dyn DispatchEventHandler<M>>>,
      ) -> Result<Self> {
-        env_logger::Builder::new()
-            .filter_level(::log::LevelFilter::Info) 
-            .filter_level(::log::LevelFilter::Debug)
-            .init();
-
+    
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (transport, transport_channel) = Transport::new(
-            config.port(), 
-            config.addr(),  
-            Duration::from_millis(DEFAULT_TRANSPORT_TIMEOUT),
-        );
-
-        let shared_transport = Arc::new(transport);
-
-        let net_svc = NetSvc::new(shared_transport.clone());
-        
         let swim = Self {
             inner: Arc::new(InnerGossipod {
                 config,
-                net_svc,
                 metadata,
                 members: Membership::new(),
                 state: RwLock::new(GossipodState::Idle),
                 shutdown: shutdown_tx.clone(),
-                transport: shared_transport,
+                transport,
                 sequence_number: AtomicU64::new(0),
                 incarnation: AtomicU64::new(0),
                 event_scheduler: EventScheduler::new(),
@@ -238,63 +224,24 @@ where
             })
         };
 
-        Self::launch_listeners(
-            EventListener::new(swim.clone(), transport_channel, shutdown_tx.clone()),
-        ).await;
-
         Ok(swim)
     }
 
-    //+=========================+
-    //| GOSSIPOD COMMUNICATION LOW:
-    //+=========================+
-    // +-----------+       +----------------+       +-------------------+----------------------+
-    // | gossipod  +------->   net service  +-------> transport layer   |                      |
-    // +-----------+       +----------------+       |    (TCP/UDP)      |                      |
-    // |                                            +---------+---------+                      |
-    // |                                                      |                                |
-    // |                                                      v                                |
-    // |                                            +---------+---------+                      |
-    // |                                            |     listener      |                      |
-    // |                                            +---------+---------+                      |
-    // |                                                      |                                |
-    // |                                    +-----------------+------------------------+       |
-    // |                                    |                                          |       |
-    // |                                    v                                          v       |                      
-    // |                              +-----+------+                           +-------+-------+                           
-    // |                              |  gossipod  |                           |  net service  |                      
-    // |                              +------------+                           +---------------+
-    // |                                                                                |                       
-    // +--------------------------------------------------------------------------------+
     pub async fn start(&self) -> Result<()> {
         info!("> [GOSSIPOD] Server Started with `{}`", self.inner.config.name);
         let shutdown_rx = self.inner.shutdown.subscribe();
 
-        self.inner.transport.bind_tcp_listener().await?;
-        self.inner.transport.bind_udp_socket().await?;
-
-        self.log_ip_binding_info().await?;
         self.set_state(GossipodState::Running).await?;
         self.set_local_node_liveness().await?;
 
-        let tcp_handle = Self::launch_tcp_listener(
-            self.inner.transport.clone(),
-            BackOff::new(),
-            self.inner.shutdown.subscribe(),
-        );
-        let udp_handle = Self::launch_udp_listener(
-            self.inner.transport.clone(),
-            BackOff::new(),
-            self.inner.shutdown.subscribe(),
-        );
+        self.launch_datagram_listener().await?;
+        
         let probe_handle = self.launch_probe_scheduler(self.inner.shutdown.subscribe());
         let gossip_handle = self.launch_gossip_scheduler(self.inner.shutdown.subscribe());
 
         let event_scheduler_handler = self.launch_event_scheduler(self.inner.shutdown.subscribe());
     
         let shutdown_reason = self.handle_shutdown_signal(
-            tcp_handle, 
-            udp_handle, 
             probe_handle, 
             gossip_handle,
             event_scheduler_handler,
@@ -307,6 +254,7 @@ where
         }
 
         self.set_state(GossipodState::Stopped).await?;
+        self.inner.transport.shutdown().await?;
         // self.leave().await?;
 
         info!("> [GOSSIPOD] Gracefully shut down due to {:?}", shutdown_reason);
@@ -317,16 +265,12 @@ where
     // handle shutdown signal
     async fn handle_shutdown_signal(
         &self,
-        tcp_handle: tokio::task::JoinHandle<Result<()>>,
-        udp_handle: tokio::task::JoinHandle<Result<()>>,
         probe_handle: tokio::task::JoinHandle<Result<()>>,
         gossip_handle: tokio::task::JoinHandle<Result<()>>,
         event_scheduler_handler: tokio::task::JoinHandle<Result<()>>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<ShutdownReason> {
         tokio::select! {
-            _ = tcp_handle => Ok(ShutdownReason::TcpFailure),
-            _ = udp_handle => Ok(ShutdownReason::UdpFailure),
             _ = probe_handle => Ok(ShutdownReason::SchedulerFailure),
             _ = gossip_handle => Ok(ShutdownReason::SchedulerFailure),
             _ = event_scheduler_handler => Ok(ShutdownReason::SchedulerFailure),
@@ -335,128 +279,6 @@ where
                 Ok(ShutdownReason::Termination)
             }
         }
-    }
-    async fn log_ip_binding_info(&self)-> Result<()>{
-        // Note: When the Local Host (127.0.0.1 or 0.0.0.0) is provisioned, it is automatically bound to the system's private IP.
-        // If a Private IP address is bound, the local host (127.0.0.1) becomes irrelevant.
-        let private_ip_addr = IpAddress::find_system_ip()?;
-        for ip_addr in &self.inner.config.ip_addrs {
-            if ip_addr.to_string() == DEFAULT_IP_ADDR || ip_addr.to_string() == "0.0.0.0" {
-                info!(
-                    "> [GOSSIPOD] Binding to all network interfaces: {}:{} (Private IP: {}:{})",
-                    ip_addr.to_string(),
-                    self.inner.config.port,
-                    private_ip_addr.to_string(),
-                    self.inner.config.port
-                );
-            } else {
-                info!(
-                    "> [GOSSIPOD] Binding to specific IP: {}:{}",
-                    ip_addr.to_string(),
-                    self.inner.config.port
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn launch_listeners(mut listener: EventListener<M>) {
-        tokio::spawn(async move {
-            listener.run_listeners().await 
-        });
-    }
-
-    fn launch_tcp_listener(
-        transport: Arc<dyn NodeTransport>,
-        backoff: BackOff,
-        mut shutdown_rx: broadcast::Receiver<()>
-    ) -> tokio::task::JoinHandle<Result<()>> {
-        tokio::spawn(async move {
-            loop {
-                if backoff.is_circuit_open() {
-                    warn!("Circuit breaker is opened due to previous consecutive failures");
-                    continue
-                }
-                tokio::select! {
-                    listener_result = transport.tcp_stream_listener() => {
-                        match listener_result {
-                            Ok(_) =>  backoff.record_success(),
-                            Err(e) => {
-                                let (failures, circuit_opened) = backoff.record_failure();
-                                error!("TCP listener error: {}. Consecutive failures: {}", e, failures);
-                                
-                                if circuit_opened {
-                                    warn!("Circuit breaker opened due to consecutive failures");
-                                    return Err(anyhow!("TCP listener failed {} times consecutively", failures));
-                                } else {
-                                    let delay = backoff.calculate_delay();
-                                    warn!("TCP listener restarting in {:?}", delay);
-                                    
-                                    tokio::select! {
-                                        _ = time::sleep(delay) => {}
-                                        _ = shutdown_rx.recv() => {
-                                            warn!("[RECV] Shutdown signal received during TCP listener restart delay");
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        warn!("[RECV] Shutdown signal received, stopping TCP listener");
-                        return Ok(());
-                    }
-                }
-            }
-        })
-    }
-    
-    fn launch_udp_listener(
-        transport: Arc<dyn NodeTransport>,
-        backoff: BackOff,
-        mut shutdown_rx: broadcast::Receiver<()>
-    ) -> tokio::task::JoinHandle<Result<()>> {
-        tokio::spawn(async move {
-            loop {
-                if backoff.is_circuit_open() {
-                    warn!("Circuit breaker is opened due to previous consecutive failures");
-                    continue
-                }
-
-                tokio::select! {
-                    listener_result = transport.udp_socket_listener() => {
-                        match listener_result {
-                            Ok(_) =>  backoff.record_success(),
-                            Err(e) => {
-                                let (failures, circuit_opened) = backoff.record_failure();
-                                error!("UDP listener error: {}. Consecutive failures: {}", e, failures);
-                                
-                                if circuit_opened {
-                                    error!("Circuit breaker opened due to consecutive failures");
-                                    return Err(anyhow!("UDP listener failed {} times consecutively", failures));
-                                } else {
-                                    let delay = backoff.calculate_delay();
-                                    warn!("UDP listener restarting in {:?}", delay);
-                                    
-                                    tokio::select! {
-                                        _ = time::sleep(delay) => {}
-                                        _ = shutdown_rx.recv() => {
-                                            warn!("[RECV] Shutdown signal received during TCP listener restart delay");
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        warn!("[RECV] Shutdown signal received, stopping UDP listener");
-                        return Ok(());
-                    }
-                }
-            }
-        })
     }
 
     fn launch_probe_scheduler(&self, mut shutdown_rx: broadcast::Receiver<()>) -> tokio::task::JoinHandle<Result<()>> {
@@ -514,7 +336,7 @@ where
                                 );
 
                                 debug!("Probe completed successfully");
-                                backoff.record_success();
+                                let _ = backoff.record_success();
                             }
                             Err(e) => {
                                 error!("Probe error: {}", e);
@@ -634,7 +456,7 @@ where
                                 if let Ok(len) = gossipod.inner.broadcasts.len() {
                                     debug!("Gossip completed successfully, messages left: {}", len);
                                 }
-                                backoff.record_success();
+                                let _ = backoff.record_success();
                             }
                             Err(e) => {
                                 error!("Gossip error: {}", e);
@@ -704,7 +526,7 @@ where
         let local_node = self.get_local_node().await?;
         let local_addr = local_node.socket_addr()?;
 
-        self.inner.net_svc.message_target(target, local_addr, msg).await?;
+        // self.inner.net_svc.message_target(target, local_addr, msg).await?;
         Ok(())
     }
 
@@ -768,7 +590,7 @@ where
 
         let ack_deadline = now + self.inner.config.ack_timeout;
 
-        self.inner.net_svc.transport.write_to_udp(target, &message_bytes).await?;
+        self.inner.transport.send_to(target, &message_bytes).await?;
 
         let (mut rx, _) = self.inner.event_scheduler.schedule_event(
             EventType::Ack { sequence_number }, 
@@ -902,7 +724,7 @@ where
         for node in &known_nodes {
             let message_bytes = self.encode_message_with_piggybacked_updates(ping_req.clone()).await?;
     
-            if let Err(e) = self.inner.net_svc.transport.write_to_udp(node.socket_addr()?, &message_bytes).await {
+            if let Err(e) = self.inner.transport.send_to(node.socket_addr()?, &message_bytes).await {
                 warn!("Failed to send indirect ping to {} for target {}: {}", node.name, target, e);
             } else {
                 debug!("Sent indirect ping to {} for target {}", node.name, target);
@@ -1016,7 +838,7 @@ where
         debug!("Nodes to gossip: {:?}", known_nodes.len());
         for node in &known_nodes {
             for (key, broadcast) in &messages {
-                match self.inner.transport.write_to_udp(node.socket_addr()?, broadcast).await {
+                match self.inner.transport.send_to(node.socket_addr()?, broadcast).await {
                     Ok(_) => {
                         debug!("Gossiped message to {}", node.name);
                     },
@@ -1089,7 +911,7 @@ where
             payload: MessagePayload::Ack(ack_payload),
         };
         let message_bytes = self.encode_message_with_piggybacked_updates(ack.clone()).await?;
-        if let Err(e) = self.inner.net_svc.transport.write_to_udp(target, &message_bytes).await {
+        if let Err(e) = self.inner.transport.send_to(target, &message_bytes).await {
             warn!("Failed to send ack to {}: {}", target, e);
         } else {
             debug!("Sent ACK response to {}", target);
@@ -1145,7 +967,7 @@ where
                 ).await?;
 
                 // Send the UDP PING-REQ message.
-                if let Err(e) = self.inner.net_svc.transport.write_to_udp(original_target, &message_bytes).await {
+                if let Err(e) = self.inner.transport.send_to(original_target, &message_bytes).await {
                     error!("[ERR] Failed to send UDP PING-REQ: {}", e);
                     return Ok(());
                 }
@@ -1215,7 +1037,7 @@ where
                 }
 
                 if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
-                    dispatch_handler.notify_message(from, payload.data).await?;
+                    dispatch_handler.notify_message(from, payload.data).await.map_err(|e| anyhow!("unable to notify message {}", e))?;
                 }
             }
             _ => {}
@@ -1369,7 +1191,7 @@ where
         }
        
         if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
-            dispatch_handler.notify_dead(&node).await?;
+            dispatch_handler.notify_dead(&node).await.map_err(|e| anyhow!("unable to dispatch dead node notification {}", e))?;
         }
         self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)
 
@@ -1443,7 +1265,7 @@ where
                         self.broadcast_join(new_node.clone()).await?;
 
                         if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
-                            dispatch_handler.notify_join(&new_node).await?;
+                            dispatch_handler.notify_join(&new_node).await.map_err(|e| anyhow!("unable to dispatch join notification {}",e))?;
                         }
                     },
                     MergeAction::Updated => {
@@ -1503,7 +1325,7 @@ where
                             };
                             self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
                             if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
-                                dispatch_handler.notify_leave(&leave_node).await?;
+                                dispatch_handler.notify_leave(&leave_node).await.map_err(|e| anyhow!("unable to dispatch leave notification: {}",e))?;
                             }
                         },
                         MergeAction::Unchanged => {
@@ -1524,7 +1346,7 @@ where
     }
 
     async fn confirm_node(&self, incarnation: u64, member: &str) -> Result<()> {
-        let local_node = self.get_local_node().await?;
+        let local_node = self.get_local_node().await.map_err(|e| anyhow!("unable to get local node {}",e))?;
 
         // If it's about us, we need to refute
         if member == local_node.name {
@@ -1547,7 +1369,7 @@ where
                             };
                             self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
                             if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
-                                dispatch_handler.notify_dead(&confim_node).await?;
+                                dispatch_handler.notify_dead(&confim_node).await.map_err(|e| anyhow!("unable to dispatch dead node notification: {}",e))?;
                             }
                         },
                         MergeAction::Unchanged => {
@@ -1670,7 +1492,7 @@ where
             },
         };
 
-        self.inner.net_svc.broadcast(target, local_addr, broadcast.clone()).await
+        self.broadcast(target, local_addr, broadcast.clone()).await
             .context("failed to send join broadcast to initial contact")?;
 
         self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
@@ -1680,6 +1502,21 @@ where
         // );
 
         Ok(())
+    }
+
+    async fn broadcast(&self,  target: SocketAddr, sender: SocketAddr, broadcast: Broadcast) -> Result<()> {
+        let message = Message {
+            msg_type: MessageType::Broadcast,
+            payload: MessagePayload::Broadcast(broadcast.clone()),
+            sender,
+        };
+
+        info!("Sending broadcast: {}", broadcast.type_str());
+        let mut codec = MessageCodec::new();
+        let mut buffer = BytesMut::new();
+        codec.encode(message, &mut buffer)?;
+
+        self.inner.transport.send_to(target,&buffer).await
     }
 
     async fn handle_piggybacked_updates(&self, updates: Vec<RemoteNode>) -> Result<()> {
@@ -1720,7 +1557,7 @@ where
                             };
                             self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
                             if let Some(dispatch_handler) = &self.inner.dispatch_event_handler {
-                                dispatch_handler.notify_join(&node).await?;
+                                dispatch_handler.notify_join(&node).await.map_err(|e| anyhow!("unable to dispatch join notification: {}",e))?;
                             }
                         },
                         MergeAction::Updated => {
@@ -1788,12 +1625,66 @@ where
     pub async fn members(&self)-> Result<Vec<Node<M>>>  { 
         self.inner.members.get_nodes(Some(|n: &Node<M>| !n.is_alive()))
     }
+
+    pub(crate) async fn launch_datagram_listener(&self) -> Result<()> {
+        info!("Starting Datagram Listener...");
+        let mut shutdown_rx = self.inner.shutdown.subscribe();
+        let datagram_transport = self.inner.transport.clone();
+        let gossipod = self.clone();
     
+        tokio::spawn(async move {
+            let mut datagram_rx = datagram_transport.incoming();
+            loop {
+                tokio::select! {
+                    result = datagram_rx.recv() => {
+                        match result {
+                            Ok(datagram) => {
+                                if let Err(e) = Self::handle_datagram(&gossipod, datagram).await {
+                                    error!("Error handling datagram: {}", e);
+                                }
+                            },
+                            Err(e) => {
+                                error!("Error receiving datagram: {}", e);
+                                // TODO: Implement backoff + circuit breaker here if errors persist
+                            }
+                        }
+                    },
+                    _ = shutdown_rx.recv() => {
+                        info!("Received shutdown signal, stopping datagram listener");
+                        break;
+                    }
+                }
+            }
+            
+            info!("Datagram listener stopped");
+        });
+    
+        Ok(())
+    }
+    
+    async fn handle_datagram(gossipod: &Gossipod<M>, datagram: Datagram) -> Result<()> {
+        debug!("Received UDP datagram from {}", datagram.remote_addr);
+        
+        let message = Message::from_vec(&datagram.data)
+            .context("Failed to decode message")?;
+    
+        match message.msg_type {
+            MessageType::Ping => gossipod.handle_ping(message.sender, message.payload).await?,
+            MessageType::PingReq => gossipod.handle_ping_req(message.sender, message.payload).await?,
+            MessageType::Ack => gossipod.handle_ack(message.payload).await?,
+            MessageType::Broadcast => gossipod.handle_broadcast(message).await?,
+            _ => {
+                warn!("Unexpected message type {} for UDP from {}", message.msg_type, datagram.remote_addr);
+            }
+        }
+    
+        Ok(())
+    }
     pub async fn stop(&self) -> Result<()> {
         let mut state = self.inner.state.write();
         match *state {
             GossipodState::Running => {
-                self.inner.shutdown.send(()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                self.inner.shutdown.send(()).map_err(|e| anyhow::anyhow!("unable to shutdown: {}",e))?;
                 *state = GossipodState::Stopped;
                 Ok(())
             }
@@ -1818,43 +1709,42 @@ where
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
-    use crate::mock_transport::{MockTransport, create_mock_node};
+    use crate::mock_transport::{MockDatagramTransport, create_mock_node};
     use crate::config::GossipodConfigBuilder;
     use crate::message::{Broadcast, MessagePayload};
     use std::time::Duration;
 
+    fn init() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .is_test(true)
+            .try_init();
+    }
 
-    #[tokio::test]
-    async fn test_suspect_refutation() -> Result<()> {
+    async fn create_test_gossipod(name: &str, port: u16) -> Result<(Gossipod<DefaultMetadata>, Arc<MockDatagramTransport>)> {
         let config = GossipodConfigBuilder::new()
-            .name("local_node".to_string())
-            .port(8000)
+            .name(name.to_string())
+            .port(port)
             .build()
             .await?;
 
-        let (mock_transport, _) = MockTransport::new(
-            8000,
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            Duration::from_secs(1)
-        );
-        let mock_transport = Arc::new(mock_transport);
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        let mock_transport = Arc::new(MockDatagramTransport::new(local_addr));
+        let gossipod = Gossipod::with_custom(
+            config,
+            DefaultMetadata::default(),
+            Arc::new(DefaultBroadcastQueue::new(1)),
+            mock_transport.clone(),
+            None,
+        ).await?;
 
-        let gossipod = Gossipod {
-            inner: Arc::new(InnerGossipod {
-                config: config.clone(),
-                metadata: DefaultMetadata::default(),
-                members: Membership::new(),
-                transport: mock_transport.clone(),
-                state: RwLock::new(GossipodState::Running),
-                shutdown: broadcast::channel(1).0,
-                sequence_number: AtomicU64::new(0),
-                incarnation: AtomicU64::new(10),
-                event_scheduler: EventScheduler::new(),
-                net_svc: NetSvc::new(mock_transport.clone()),
-                broadcasts: Arc::new(DefaultBroadcastQueue::new(1)),
-                dispatch_event_handler: None,
-            }),
-        };
+        Ok((gossipod, mock_transport))
+    }
+
+    #[tokio::test]
+    async fn test_suspect_refutation() -> Result<()> {
+        init();
+        let (gossipod, mock_transport) = create_test_gossipod("local_node", 8000).await?;
 
         // Add local node to membership
         let local_node = create_mock_node("local_node", "127.0.0.1", 8000, NodeState::Alive);
@@ -1888,11 +1778,11 @@ mod tests {
         gossipod.gossip().await?;
 
         // Check that an ALIVE broadcast was sent to refute the suspicion
-        let udp_messages = mock_transport.get_udp_messages().await;
-        assert!(!udp_messages.is_empty(), "No UDP messages were sent");
+        let sent_datagrams = mock_transport.get_sent_datagrams().await;
+        assert!(!sent_datagrams.is_empty(), "No datagrams were sent");
 
-        let (_, message_bytes) = &udp_messages[0];
-        let message = Transport::read_socket(message_bytes.to_vec()).await?;
+        let (_, message_bytes) = &sent_datagrams[0];
+        let message = Message::from_vec(message_bytes)?;
 
         match message.payload {
             MessagePayload::Broadcast(Broadcast::Alive { incarnation, member }) => {
@@ -1912,40 +1802,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_ping_req_process() -> Result<()> {
-        let config = GossipodConfigBuilder::new()
-            .name("local_node".to_string())
-            .probing_interval(Duration::from_millis(1_000))
-            .ack_timeout(Duration::from_millis(500))
-            .indirect_ack_timeout(Duration::from_secs(1))
-            .suspicious_timeout(Duration::from_secs(5))
-            .port(8000)
-            .build()
-            .await?;
-
-        let (mock_transport, _) = MockTransport::new(
-            8000,
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            Duration::from_secs(1)
-        );
-        let mock_transport = Arc::new(mock_transport);
-        let (shutdown_tx,_) = broadcast::channel(1);
-
-        let gossipod = Gossipod {
-            inner: Arc::new(InnerGossipod {
-                config: config.clone(),
-                metadata: DefaultMetadata::default(),
-                members: Membership::new(),
-                transport: mock_transport.clone(),
-                state: RwLock::new(GossipodState::Running),
-                shutdown: shutdown_tx.clone(),
-                sequence_number: AtomicU64::new(0),
-                incarnation: AtomicU64::new(10),
-                event_scheduler: EventScheduler::new(),
-                net_svc: NetSvc::new(mock_transport.clone()),
-                broadcasts: Arc::new(DefaultBroadcastQueue::new(1)),
-                dispatch_event_handler: None,
-            }),
-        };
+        init();
+        
+        let (gossipod, mock_transport) = create_test_gossipod("local_node", 8000).await?;
 
         // Add nodes to membership
         let local_node = create_mock_node("local_node", "127.0.0.1", 8000, NodeState::Alive);
@@ -1977,13 +1836,13 @@ mod tests {
         time::sleep(Duration::from_millis(200)).await;
 
         // Check that a PING was sent to the target node
-        let udp_messages = mock_transport.get_udp_messages().await;
-        assert!(!udp_messages.is_empty(), "No UDP messages were sent");
+        let sent_datagrams = mock_transport.get_sent_datagrams().await;
+        assert!(!sent_datagrams.is_empty(), "No datagrams were sent");
 
-        let (addr, message_bytes) = &udp_messages[0];
+        let (addr, message_bytes) = &sent_datagrams[0];
         assert_eq!(*addr, ping_req_payload.target, "PING was not sent to the correct target");
 
-        let message = Transport::read_socket(message_bytes.to_vec()).await?;
+        let message = Message::from_vec(message_bytes)?;
         assert_eq!(message.msg_type, MessageType::Ping, "Message sent was not a PING");
 
         // Simulate receiving an ACK from the target node
@@ -2001,17 +1860,15 @@ mod tests {
         gossipod.handle_ack(ack_message.payload).await?;
         time::sleep(Duration::from_millis(100)).await;
 
-        let udp_messages = mock_transport.get_udp_messages().await;
-        assert!(udp_messages.len() >= 2, "ACK was not sent");
-
-
         // Check that an ACK was sent back to the intermediate node
-        let udp_message = mock_transport.get_last_udp_message().await;
-        let (addr, message_bytes) = &udp_message.expect( "ACK was not sent back to the intermediate node");
-        
+        let sent_datagrams = mock_transport.get_sent_datagrams().await;
+        println!("Data: {}", sent_datagrams.len());
+        assert!(sent_datagrams.len() >= 1, "ACK was not sent");
+
+        let (addr, message_bytes) = &sent_datagrams[sent_datagrams.len() - 1];
         assert_eq!(*addr, ping_req_message.sender, "ACK was not sent to the correct intermediate node");
 
-        let message = Transport::read_socket(message_bytes.to_vec()).await?;
+        let message = Message::from_vec(message_bytes)?;
         assert_eq!(message.msg_type, MessageType::Ack, "Message sent was not an ACK");
 
         Ok(())

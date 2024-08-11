@@ -1,6 +1,6 @@
 use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc, time::Duration};
 use anyhow::{Context as _, Result};
-use gossipod::{config::{GossipodConfigBuilder, NetworkType}, DefaultBroadcastQueue, Gossipod, NodeMetadata};
+use gossipod::{config::{GossipodConfigBuilder, NetworkType}, DefaultBroadcastQueue, DefaultTransport, Gossipod, NodeMetadata};
 use log::*;
 use serde::{Deserialize, Serialize};
 use tokio::time;
@@ -34,6 +34,11 @@ impl NodeMetadata for Metadata {}
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    env_logger::Builder::new()
+        .filter_level(::log::LevelFilter::Info) 
+        .filter_level(::log::LevelFilter::Debug)
+        .init();
+
     let config = GossipodConfigBuilder::new()
         .name(&args.name)
         .port(args.port)
@@ -56,7 +61,8 @@ async fn main() -> Result<()> {
 
     // Use Default broadcast Queue
     let broadcast_queue =  Arc::new(DefaultBroadcastQueue::new(1));
-    let gossipod = Gossipod::with_custom(config, metadata, broadcast_queue, None)
+    let transport = Arc::new(DefaultTransport::new(config.addr(), config.port()).await?);
+    let gossipod = Gossipod::with_custom(config, metadata, broadcast_queue, transport, None)
         .await
         .context("Failed to initialize Gossipod with custom metadata")?;
 

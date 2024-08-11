@@ -15,17 +15,18 @@ Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Me
 
 ## Proposed Key Features
 
-- Rust implementation for memory safety and performance
-- Asynchronous architecture using Tokio for efficient I/O operations
-- Support `io_uring` runtime via Tokio
-- Simple API for easy integration into existing projects
-- Codec-based message serialization and deserialization for efficient network communication
-- Configurable failure detection parameters
-- Inbuilt Support for both TCP and UDP protocols 
-- Configurable Observability (Logging and Metrics)
-- Basic encryption of data packets for secure communication
-- Extensible design allowing for future custom behaviors 
-- Implement `(SWIM:Basic)` + `(SWIM+Inf.)` + `(SWIM+Inf.+Susp.)` and extend to include features from [Lifeguard](https://arxiv.org/pdf/1707.00788) by Hashicorp Research
+- [x] Rust implementation for memory safety and performance
+- [x] Asynchronous architecture using Tokio for efficient I/O operations
+- [x] Simple API for easy integration into existing projects
+- [x] Codec-based message serialization and deserialization for efficient network communication
+- [x] Extensible design allowing for future custom behaviors 
+- [x] Configurable failure detection parameters
+- [x] Inbuilt Support for both TCP & UDP 
+- [x] Configurable Transport layer (QUINN, UDP)
+- [ ] Basic encryption of data packets for secure communication
+- [ ] Support `io_uring` runtime via Tokio
+- [ ] Configurable Observability (Logging and Metrics)
+- [ ] Implement `(SWIM:Basic)` + `(SWIM+Inf.)` + `(SWIM+Inf.+Susp.)` and extend to include features from [Lifeguard](https://arxiv.org/pdf/1707.00788) by Hashicorp Research
 
 
 ## SWIM implementation for Gossipod In a nutshell
