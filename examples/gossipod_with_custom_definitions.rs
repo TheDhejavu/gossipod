@@ -1,7 +1,11 @@
 use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc, time::Duration};
 use anyhow::{Context as _, Result};
-use gossipod::{config::{GossipodConfigBuilder, NetworkType}, DefaultBroadcastQueue, Gossipod, NodeMetadata};
-use log::*;
+use gossipod::{config::{GossipodConfigBuilder, NetworkType}, DefaultBroadcastQueue, DefaultTransport, Gossipod, NodeMetadata};
+use tracing_subscriber::{fmt, EnvFilter};
+use tracing::{info, error};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+
 use serde::{Deserialize, Serialize};
 use tokio::time;
 use clap::Parser;
@@ -29,10 +33,26 @@ struct Metadata {
 }
 
 impl NodeMetadata for Metadata {}
+fn setup_tracing() {
+    let fmt_layer = fmt::layer()
+        .with_target(true)
+        .with_ansi(true)
+        .with_level(true);
+
+    let filter_layer = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("debug"));
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .init();
+}
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    setup_tracing();
 
     let config = GossipodConfigBuilder::new()
         .name(&args.name)
@@ -56,7 +76,8 @@ async fn main() -> Result<()> {
 
     // Use Default broadcast Queue
     let broadcast_queue =  Arc::new(DefaultBroadcastQueue::new(1));
-    let gossipod = Gossipod::with_custom(config, metadata, broadcast_queue, None)
+    let transport = Arc::new(DefaultTransport::new(config.ip_addr(), config.port()).await?);
+    let gossipod = Gossipod::with_custom(config, metadata, broadcast_queue, transport, None)
         .await
         .context("Failed to initialize Gossipod with custom metadata")?;
 

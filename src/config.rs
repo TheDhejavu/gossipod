@@ -1,12 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
-use std::sync::Arc;
 use gethostname::gethostname;
 use std::time::Duration;
 
 use anyhow::Result;
 use crate::ip_addr::IpAddress;
-use crate::broadcast_queue::{DefaultBroadcastQueue, BroadcastQueue};
 
 // Default configuration constants
 pub(crate) const DEFAULT_IP_ADDR: &str = "127.0.0.1";
@@ -17,15 +15,14 @@ pub(crate) const DEFAULT_BASE_GOSSIP_INTERVAL: u64 = 1_000; // 1 second base int
 pub(crate) const DEFAULT_ACK_TIMEOUT: u64 = 500; // 500 milliseconds
 pub(crate) const DEFAULT_INDIRECT_ACK_TIMEOUT: u64 = 1_000; // 1 second
 pub(crate) const DEFAULT_BASE_SUSPICIOUS_TIMEOUT: u64 = 5_000; // 5 seconds
-pub(crate) const DEFAULT_MESSAGE_BUFFER_SIZE: usize = 1_024; 
 pub(crate) const DEFAULT_TRANSPORT_TIMEOUT: u64 = 5_000;
-pub(crate) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 100;
+pub(crate) const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 1_000;
 pub(crate) const MAX_RETRY_DELAY: u64 = 60; // in secs
 pub(crate) const MAX_UDP_PACKET_SIZE: usize = 1400; 
 pub(crate) const BROADCAST_FANOUT: usize = 2; 
 pub(crate) const INDIRECT_REQ: usize = 2;
 
-/// Represents the type of network environment the gossip protocol is operating in.
+/// [`NetworkType`] Represents the type of network environment the gossip protocol is operating in.
 /// This affects various timing and timeout calculations.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NetworkType {
@@ -46,7 +43,7 @@ impl Default for NetworkType {
     }
 }
 
-/// Main configuration structure for the Gossipod protocol
+/// [`GossipodConfig`] configuration structure for the Gossipod protocol
 pub struct GossipodConfig {
     /// Name of the node, used for identification in the cluster
     pub(crate) name: String,
@@ -54,8 +51,8 @@ pub struct GossipodConfig {
     /// Port number on which the node will listen for gossip messages
     pub(crate) port: u16,
 
-    /// List of IP addresses the node will bind to
-    pub(crate) ip_addrs: Vec<IpAddr>,
+    /// IP Address the node will bind to
+    pub(crate) ip_addr: IpAddr,
 
     /// Base interval for probing other nodes in the cluster
     /// This value is adjusted based on cluster size and network type
@@ -87,6 +84,10 @@ pub struct GossipodConfig {
     /// The time window during which supposedly dead nodes are still included in gossip,
     /// allowing them an opportunity to refute their dead status if they're actually alive.
     pub(crate) dead_node_gossip_window: Duration,
+
+    // Disable tcp listener. When TCP is disabled, connection-oriented messages like AppMsg
+    // automatically never gets processed. 
+    pub(crate) disable_tcp: bool,
 }
 
 impl Clone for GossipodConfig {
@@ -94,7 +95,7 @@ impl Clone for GossipodConfig {
         GossipodConfig {
             name: self.name.clone(),
             port: self.port,
-            ip_addrs: self.ip_addrs.clone(),
+            ip_addr: self.ip_addr.clone(),
             base_probing_interval: self.base_probing_interval,
             base_gossip_interval: self.base_gossip_interval,
             ack_timeout: self.ack_timeout,
@@ -103,18 +104,14 @@ impl Clone for GossipodConfig {
             network_type: self.network_type.clone(),
             initial_cluster_size: self.initial_cluster_size,
             dead_node_gossip_window: self.dead_node_gossip_window,
+            disable_tcp: self.disable_tcp,
         }
     }
 }
 
 impl GossipodConfig {
-    /// Get the IP addresses.
-    pub fn ip_addrs(&self) -> &[IpAddr] {
-        &self.ip_addrs
-    }
-
-    pub fn addr(&self) -> IpAddr {
-        self.ip_addrs[0]
+    pub fn ip_addr(&self) -> IpAddr {
+        self.ip_addr
     }
 
     pub fn name(&self) -> String {
@@ -183,7 +180,7 @@ impl GossipodConfig {
 pub struct GossipodConfigBuilder {
     pub(crate) name: Option<String>,
     pub(crate) port: u16,
-    pub(crate) ip_addrs: Vec<IpAddr>,
+    pub(crate) ip_addr: IpAddr,
     pub(crate) base_probing_interval: Duration,
     pub(crate) base_gossip_interval: Duration,
     pub(crate) ack_timeout: Duration,
@@ -192,6 +189,7 @@ pub struct GossipodConfigBuilder {
     pub(crate) network_type: NetworkType,
     pub(crate) initial_cluster_size: usize,
     pub(crate) dead_node_gossip_window: Duration,
+    pub(crate) disable_tcp: bool,
 }
 
 impl Default for GossipodConfigBuilder {
@@ -202,7 +200,7 @@ impl Default for GossipodConfigBuilder {
         Self {
             name: None,
             port: DEFAULT_PORT,
-            ip_addrs: vec![ip_addr],
+            ip_addr: ip_addr,
             base_probing_interval: Duration::from_millis(DEFAULT_BASE_PROBING_INTERVAL),
             ack_timeout: Duration::from_millis(DEFAULT_ACK_TIMEOUT),
             indirect_ack_timeout: Duration::from_millis(DEFAULT_INDIRECT_ACK_TIMEOUT),
@@ -210,13 +208,14 @@ impl Default for GossipodConfigBuilder {
             network_type: NetworkType::default(),
             base_gossip_interval:  Duration::from_millis(DEFAULT_BASE_GOSSIP_INTERVAL),
             initial_cluster_size: 1,
+            disable_tcp: false,
             dead_node_gossip_window:  Duration::from_millis(DEFAULT_DEAD_NODE_GOSSIP_WINDOW),
         }
     }
 }
 
 impl GossipodConfigBuilder {
-    /// Creates a new GossipodConfigBuilder with default values
+    /// Creates a new [`GossipodConfigBuilder`] with default values
     pub fn new() -> Self {
         Self::default()
     }
@@ -235,13 +234,18 @@ impl GossipodConfigBuilder {
 
     /// Sets the IP address for the node
     pub fn addr(mut self, addr: impl Into<IpAddress>) -> Self {
-        self.ip_addrs = vec![addr.into().0];
+        self.ip_addr = addr.into().0;
         self
     }
 
     /// Sets initial cluster size
     pub fn cluster_size(mut self, cluster_size: usize) -> Self {
         self.initial_cluster_size = cluster_size;
+        self
+    }
+
+    pub fn disable_tcp(mut self, disable: bool) -> Self {
+        self.disable_tcp = disable;
         self
     }
 
@@ -298,7 +302,7 @@ impl GossipodConfigBuilder {
     ///
     /// Checks that all necessary fields are set and have non-zero values where appropriate.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.ip_addrs.is_empty() {
+        if self.ip_addr.to_string() == "" {
             anyhow::bail!("bind address is not set");
         }
         if self.port == 0 {
@@ -337,7 +341,7 @@ impl GossipodConfigBuilder {
         Ok(GossipodConfig {
             name: self.name.unwrap(),
             port: self.port,
-            ip_addrs: self.ip_addrs,
+            ip_addr: self.ip_addr,
             base_probing_interval: self.base_probing_interval,
             base_gossip_interval: self.base_gossip_interval,
             ack_timeout: self.ack_timeout,
@@ -345,6 +349,7 @@ impl GossipodConfigBuilder {
             base_suspicious_timeout: self.base_suspicious_timeout,
             network_type: self.network_type,
             initial_cluster_size: self.initial_cluster_size,
+            disable_tcp: self.disable_tcp,
             dead_node_gossip_window: self.dead_node_gossip_window,
         })
     }

@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use anyhow::{anyhow, Result};
-use if_addrs::get_if_addrs;
+use sysinfo::Networks;
 
 /// A wrapper around `std::net::IpAddr` providing additional functionality.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,14 +38,20 @@ impl IpAddress {
     ///
     /// Returns the first non-loopback IPv4 address found, or an error if none is available.
     pub fn find_system_ip() -> Result<IpAddr> {
-        get_if_addrs()?
-            .into_iter()
-            .find(|iface| !iface.is_loopback() && iface.addr.ip().is_ipv4())
-            .map(|iface| iface.addr.ip())
-            .ok_or_else(|| anyhow!("No suitable IP address found"))
+        let networks = Networks::new_with_refreshed_list();
+        for (_, data) in &networks {
+            for ip in data.ip_networks() {
+                if let IpAddr::V4(ipv4) = ip.addr {
+                    if !ipv4.is_loopback() {
+                        return Ok(IpAddr::V4(ipv4));
+                    }
+                }
+            }
+        }
+
+        Err(anyhow!("No suitable IPv4 address found"))
     }
 }
-
 impl AsRef<IpAddr> for IpAddress {
     fn as_ref(&self) -> &IpAddr {
         &self.0

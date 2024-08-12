@@ -1,16 +1,21 @@
+use std::error::Error;
 use std::net::SocketAddr;
-use std::{net::Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
 
 use async_trait::async_trait;
 use gossipod::{config::{GossipodConfigBuilder, NetworkType}, DispatchEventHandler, Gossipod, Node, NodeMetadata};
-use log::*;
+use tracing::{info, error};
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
 use tokio::time;
 use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
 const NODE_NAME: &str = "NODE_1";
 const BIND_PORT: u16 = 7948;
@@ -39,30 +44,31 @@ impl EventHandler {
     }
 }
 
+type DispatchError = Box<dyn Error + Send + Sync>;
+
 #[async_trait]
 impl<M: NodeMetadata> DispatchEventHandler<M> for EventHandler {
-    async fn notify_dead(&self, node: &Node<M>) -> Result<()> {
+    async fn notify_dead(&self, node: &Node<M>) -> Result<(), DispatchError> {
         info!("Node {} detected as dead", node.name);
         Ok(())
     }
 
-    async fn notify_leave(&self, node: &Node<M>) -> Result<()> {
+    async fn notify_leave(&self, node: &Node<M>) -> Result<(), DispatchError>  {
         info!("Node {} is leaving the cluster", node.name);
         Ok(())
     }
 
-    async fn notify_join(&self, node: &Node<M>) -> Result<()> {
+    async fn notify_join(&self, node: &Node<M>) ->Result<(), DispatchError> {
         info!("Node {} has joined the cluster", node.name);
         Ok(())
     }
 
-    async fn notify_message(&self, from: SocketAddr, message: Vec<u8>) -> Result<()> {
+    async fn notify_message(&self, from: SocketAddr, message: Vec<u8>) -> Result<(),DispatchError>  {
         info!("Received message from {}: {:?}", from, message);
         self.sender.send(message).await?;
         Ok(())
     }
 }
-
 
 impl SwimNode {
     async fn new(args: &Args) -> Result<Self> {
@@ -86,7 +92,6 @@ impl SwimNode {
         .await
         .context("Failed to initialize Gossipod with custom metadata")?;
 
-       
         Ok(SwimNode {
             gossipod: gossipod.into(),
             receiver,
@@ -181,9 +186,27 @@ struct Args {
     join_addr: Option<String>,
 }
 
+
+fn setup_tracing() {
+    let fmt_layer = fmt::layer()
+        .with_target(true)
+        .with_ansi(true)
+        .with_level(true);
+
+    let filter_layer = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("debug"));
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .init();
+}
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    setup_tracing();
 
     let mut node = SwimNode::new(&args).await?;
     node.start().await?;

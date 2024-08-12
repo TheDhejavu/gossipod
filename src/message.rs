@@ -1,13 +1,11 @@
 // SWIM Protocol Message and Message Type.
 use anyhow::{anyhow, Result};
-use log::info;
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
-use tokio_util::{bytes::BytesMut, codec::{Decoder, Encoder}};
+use tokio_util::{bytes::BytesMut, codec::Decoder};
 use core::fmt;
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
-use crate::{codec::MessageCodec, node::{Node, NodeMetadata}, transport::{NodeTransport, Transport}, NodeState};
+use crate::{codec::MessageCodec, NodeState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PingPayload {
@@ -63,7 +61,7 @@ pub(crate) struct SyncReqPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Eq, PartialEq, Deserialize)]
-pub(crate) struct RemoteNode {
+pub struct RemoteNode {
     pub name: String,
     pub address: SocketAddr,
     pub metadata: Vec<u8>,
@@ -98,7 +96,7 @@ pub enum Broadcast {
 
 impl Broadcast {
     /// Returns a string representation of the broadcast type
-    fn type_str(&self) -> &'static str {
+    pub(crate) fn type_str(&self) -> &'static str {
         match self {
             Broadcast::Suspect { .. } => "SUSPECT",
             Broadcast::Join { .. } => "JOIN",
@@ -200,96 +198,5 @@ impl fmt::Display for MessageType {
             MessageType::AppMsg => write!(f, "APP_MSG"),
             MessageType::Broadcast => write!(f, "BROADCAST"),
         }
-    }
-}
-
-pub(crate) struct NetSvc {
-    pub(crate) transport: Arc<dyn NodeTransport>,
-}
-
-impl NetSvc {
-    /// Creates a new MessageBroker instance
-    pub fn new(transport: Arc<dyn NodeTransport>) -> Self {
-        Self { transport }
-    }
-
-    /// Synchronizes state with a target node
-    pub async fn sync_state<T: NodeMetadata>(&self, target: SocketAddr, sender: SocketAddr, members: &[Node<T>]) -> Result<Vec<RemoteNode>> {
-        let mut stream = self.transport.dial_tcp(target).await?;
-        info!("Initiating sync state with: {}", target);
-    
-        self.send_sync_request(&mut stream, sender, members).await?;
-        self.receive_sync_response(&mut stream).await
-    }
-
-    /// Receives a sync response from a stream
-    async fn receive_sync_response(&self, stream: &mut TcpStream) -> Result<Vec<RemoteNode>> {
-        let message = Transport::read_stream(stream).await?;
-
-        match message.payload {
-            MessagePayload::SyncReq(payload) => Ok(payload.members),
-            _ => Err(anyhow!("unexpected message payload")),
-        }
-    }
-
-    /// Sends a sync request to a stream
-    pub async fn send_sync_request<M: NodeMetadata>(&self, stream: &mut TcpStream, sender: SocketAddr, members: &[Node<M>]) -> Result<()> {
-        let sync_payload = SyncReqPayload { 
-            sender,
-            members: members.iter()
-                .map(|member| {
-                    Ok(RemoteNode { 
-                        name: member.name.clone(), 
-                        address: member.socket_addr()?,
-                        state: member.state(),
-                        metadata: member.metadata.to_bytes()?,
-                        incarnation: member.incarnation(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        };
-
-        let message = Message {
-            msg_type: MessageType::SyncReq,
-            payload: MessagePayload::SyncReq(sync_payload),
-            sender,
-        };
-        
-        let mut codec = MessageCodec::new();
-        let mut buffer = BytesMut::new();
-        codec.encode(message, &mut buffer)?;
-
-        self.transport.write_to_tcp(stream, &buffer).await
-    }
-
-    pub async fn broadcast(&self,  target: SocketAddr, sender: SocketAddr, broadcast: Broadcast) -> Result<()> {
-        let message = Message {
-            msg_type: MessageType::Broadcast,
-            payload: MessagePayload::Broadcast(broadcast.clone()),
-            sender,
-        };
-
-        info!("Sending broadcast: {}", broadcast.type_str());
-        let mut codec = MessageCodec::new();
-        let mut buffer = BytesMut::new();
-        codec.encode(message, &mut buffer)?;
-
-        self.transport.write_to_udp(target,&buffer).await
-    }
-
-    pub async fn message_target(&self,  target: SocketAddr, sender: SocketAddr, data: &[u8]) -> Result<()> {
-        let message_payload = AppMsgPayload {data: data.to_vec()};
-        let message = Message {
-            msg_type: MessageType::AppMsg,
-            payload: MessagePayload::AppMsg(message_payload),
-            sender,
-        };
-
-        let mut codec = MessageCodec::new();
-        let mut buffer = BytesMut::new();
-        codec.encode(message, &mut buffer)?;
-
-        let mut stream = self.transport.dial_tcp(target).await?;
-        self.transport.write_to_tcp(&mut stream, &buffer).await
     }
 }

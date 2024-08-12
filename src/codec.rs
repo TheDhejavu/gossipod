@@ -1,10 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use serde::de::DeserializeOwned;
 use tokio_util::{bytes::{Buf, BufMut, BytesMut}, codec::{Decoder, Encoder}};
 use crate::{message::{AckPayload, AppMsgPayload, Broadcast, Message, MessagePayload, MessageType, NoAckPayload, PingPayload, PingReqPayload, RemoteNode, SyncReqPayload}, state::NodeState};
 
-/// MessageCodec: Append-Only, Length-Prefixed Encoding Scheme
+/// [`MessageCodec`]: Append-Only, Length-Prefixed Encoding Scheme
 ///
 /// This codec uses an append-only format where each piece of data is prefixed
 /// with its length, followed by the data itself. This allows for efficient
@@ -63,7 +63,6 @@ impl MessageCodec {
                 dst.put_u16(addr_v6.port());
                 return Ok(())
             },
-            _ => Err(bail!("address does not match v4 or v6"))
         }
     }
 

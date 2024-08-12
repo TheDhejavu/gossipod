@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use anyhow::{anyhow, Result};
+
 use crate::config::MAX_RETRY_DELAY;
 
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
@@ -20,7 +22,7 @@ pub(crate) struct BackOff {
 }
 
 impl BackOff {
-    /// Creates a new `BackOff` with no failures and the current time as the last success.
+    /// Creates a new [`BackOff`] with no failures and the current time as the last success.
     pub(crate) fn new() -> Self {
         Self {
             consecutive_failures: AtomicU32::new(0),
@@ -29,23 +31,23 @@ impl BackOff {
             last_failure: std::sync::Mutex::new(None),
             reset_timeout: CIRCUIT_BREAKER_RESET_TIMEOUT,
         }
-    } 
+    }
 
     /// Increments the count of consecutive failures and returns the new count.
     /// Also checks if the circuit breaker should be opened.
-    pub(crate) fn record_failure(&self) -> (u32, bool) {
+    pub(crate) fn record_failure(&self) -> Result<(u32, bool)> {
         let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut last_failure = self.last_failure.lock().unwrap();
+        let mut last_failure = self.last_failure.lock().map_err(|e| anyhow!("unable to acquire lock: {}", e))?;
         *last_failure = Some(Instant::now());
 
         let circuit_opened = if failures >= CIRCUIT_BREAKER_THRESHOLD {
             self.circuit_open.store(true, Ordering::SeqCst);
             true
         } else {
-            false
+          false
         };
 
-        (failures, circuit_opened)
+        Ok((failures, circuit_opened))
     }
 
     /// Calculates the delay before the next attempt based on the number of consecutive failures.
@@ -57,28 +59,46 @@ impl BackOff {
     }
 
     /// Resets the backoff state to its initial values.
-    pub(crate) fn record_success(&self) {
+    pub(crate) fn record_success(&self) -> Result<()>{
         self.consecutive_failures.store(0, Ordering::SeqCst);
-        let mut last_success = self.last_success.lock().unwrap();
+        let mut last_success = self.last_success.lock().map_err(|e| anyhow!("{}", e))?;
         *last_success = Instant::now();
         self.circuit_open.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Checks if the circuit is open.
     /// If the circuit has been open for longer than the reset timeout, it will attempt to close it.
-    pub(crate) fn is_circuit_open(&self) -> bool {
+    pub(crate) fn is_circuit_open(&self) -> Result<bool> {
         if self.circuit_open.load(Ordering::SeqCst) {
-            let last_failure = self.last_failure.lock().unwrap();
+            let last_failure = self.last_failure.lock().map_err(|e| anyhow!("{}", e))?;
             if let Some(time) = *last_failure {
                 if time.elapsed() > self.reset_timeout {
                     self.circuit_open.store(false, Ordering::SeqCst);
                     self.consecutive_failures.store(0, Ordering::SeqCst);
-                    return false;
+                    return Ok(false);
                 }
             }
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
+        }
+    }
+
+    /// Calculates the time until the circuit breaker will open based on the last failure time
+    pub(crate) fn time_until_open(&self) -> Result<Duration> {
+        let last_failure = self.last_failure.lock().map_err(|e| anyhow!("unable to lock failure state: {}", e))?;
+        if let Some(failure_time) = *last_failure {
+            let now = Instant::now();
+            let elapsed = now.duration_since(failure_time);
+            
+            if elapsed >= self.reset_timeout {
+                Ok(Duration::from_secs(0))
+            } else {
+                Ok(self.reset_timeout - elapsed)
+            }
+        } else {
+            Err(anyhow!("No last failure recorded"))
         }
     }
 }
@@ -95,37 +115,37 @@ mod tests {
 
         // Initial state
         assert_eq!(backoff.consecutive_failures.load(Ordering::SeqCst), 0);
-        assert!(!backoff.is_circuit_open());
+        assert!(!backoff.is_circuit_open().expect("should not error-out"));
 
         // Record failures until circuit opens
         for i in 1..=CIRCUIT_BREAKER_THRESHOLD {
-            let (failures, circuit_opened) = backoff.record_failure();
+            let (failures, circuit_opened) = backoff.record_failure().expect("should not error-out");
             assert_eq!(failures, i);
             assert_eq!(circuit_opened, i == CIRCUIT_BREAKER_THRESHOLD);
         }
 
         // Check circuit is open
-        assert!(backoff.is_circuit_open());
+        assert!(backoff.is_circuit_open().expect("should not error-out"));
 
         // Calculate delay
         let delay = backoff.calculate_delay();
         assert_eq!(delay, Duration::from_secs(32)); // 2^5 = 32
 
         // Record success
-        backoff.record_success();
+        let _ = backoff.record_success();
         assert_eq!(backoff.consecutive_failures.load(Ordering::SeqCst), 0);
-        assert!(!backoff.is_circuit_open());
+        assert!(!backoff.is_circuit_open().expect("should not error-out"));
 
         // Test circuit breaker reset timeout
         for _ in 1..=CIRCUIT_BREAKER_THRESHOLD {
-            backoff.record_failure();
+            let _ = backoff.record_failure();
         }
-        assert!(backoff.is_circuit_open());
+        assert!(backoff.is_circuit_open().expect("should not error-out"));
         thread::sleep(Duration::from_millis(150));
-        assert!(backoff.is_circuit_open()); // Circuit should still be open
+        assert!(backoff.is_circuit_open().expect("should not error-out")); // Circuit should still be open
         thread::sleep(Duration::from_millis(151));
         
-        assert!(!backoff.is_circuit_open()); // Circuit should auto-close after timeout
+        assert!(!backoff.is_circuit_open().expect("should not error-out")); // Circuit should auto-close after timeout
         assert_eq!(backoff.consecutive_failures.load(Ordering::SeqCst), 0); // Failures should be reset
     }
 
@@ -135,10 +155,10 @@ mod tests {
 
         // Record failures, but not enough to open circuit
         for i in 1..CIRCUIT_BREAKER_THRESHOLD {
-            let (failures, circuit_opened) = backoff.record_failure();
+            let (failures, circuit_opened) = backoff.record_failure().expect("should not error-out");
             assert_eq!(failures, i);
             assert!(!circuit_opened);
-            assert!(!backoff.is_circuit_open());
+            assert!(!backoff.is_circuit_open().expect("should not error-out"));
         }
 
         // Check delay increases
@@ -146,8 +166,8 @@ mod tests {
         assert_eq!(delay, Duration::from_secs(16)); // 2^4 = 16
 
         // Record success
-        backoff.record_success();
+        let _ = backoff.record_success();
         assert_eq!(backoff.consecutive_failures.load(Ordering::SeqCst), 0);
-        assert!(!backoff.is_circuit_open());
+        assert!(!backoff.is_circuit_open().expect("should not error-out"));
     }
 }

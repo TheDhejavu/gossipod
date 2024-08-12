@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
-use log::warn;
+use tracing::warn;
 use serde::{Serialize, Deserialize};
 use sysinfo::System;
 use std::cmp::Ordering;
@@ -229,7 +229,7 @@ pub struct Node<M> {
 
 impl<M: NodeMetadata> Node<M> {
   
-    /// Creates a new `Node` with the given IP address, port, name, and metadata.
+    /// Creates a new [`Node`] with the given IP address, port, name, and metadata.
     pub fn new(ip_addr: IpAddr, port: u16, name: String, incarnation: u64, metadata: M) -> Self {
         Self {
             ip_addr,
@@ -240,7 +240,7 @@ impl<M: NodeMetadata> Node<M> {
         }
     }
 
-    /// Creates a new node with state
+    /// Creates a new  [`Node`] with state
     pub fn with_state(state: NodeState, ip_addr: IpAddr, port: u16, name: String, incarnation: u64, metadata: M ) -> Self {
         Self {
             ip_addr,

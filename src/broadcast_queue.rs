@@ -104,7 +104,7 @@ pub struct DefaultBroadcastQueue {
 }
 
 impl DefaultBroadcastQueue {
-    /// Creates a new DefaultBroadcastQueue with the given initial cluster size
+    /// Creates a new [`DefaultBroadcastQueue`] with the given initial cluster size
     pub fn new(initial_cluster_size: usize) -> Self {
         let max_retransmits = Self::calculate_max_retransmits(initial_cluster_size);
         Self {

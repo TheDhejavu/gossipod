@@ -1,152 +1,60 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{collections::VecDeque, net::IpAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
-use anyhow::{Result, anyhow};
+use std::error::Error;
+use tokio::sync::{broadcast, Mutex};
 use async_trait::async_trait;
-use std::collections::VecDeque;
-use std::time::Duration;
-use parking_lot::RwLock;
-use crate::config::{DEFAULT_CHANNEL_BUFFER_SIZE, MAX_UDP_PACKET_SIZE};
-use crate::node::Node;
-use crate::transport::{NetworkTcpStream, NetworkUdpSocket, NodeTransport, TransportChannel};
-use crate::DefaultMetadata;
+
 use crate::state::NodeState;
+use crate::{DefaultMetadata, Node};
 
+use super::{DatagramTransport, Datagram};
 
-pub(crate) struct MockTransport {
-    port: u16,
-    ip_addr: IpAddr,
-    tcp_listener: Arc<RwLock<Option<Arc<()>>>>, 
-    udp_socket: Arc<RwLock<Option<Arc<()>>>>,
-    dial_timeout: Duration,
-    tcp_stream_tx: mpsc::Sender<NetworkTcpStream>,
-    udp_socket_tx: mpsc::Sender<NetworkUdpSocket>,
-    tcp_connections: Arc<Mutex<Vec<SocketAddr>>>,
-    tcp_messages: Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>,
-    udp_messages: Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>,
-    tcp_dial_results: Arc<Mutex<VecDeque<Result<TcpStream>>>>,
+pub struct MockDatagramTransport {
+    incoming_queue: Arc<Mutex<VecDeque<Datagram>>>,
+    outgoing_queue: Arc<Mutex<VecDeque<(SocketAddr, Vec<u8>)>>>,
+    datagram_tx: broadcast::Sender<Datagram>,
+    local_addr: SocketAddr,
 }
 
-impl MockTransport {
-    pub(crate) fn new(port: u16, ip_addr: IpAddr, dial_timeout: Duration) -> (Self, TransportChannel) {
-        let (tcp_stream_tx, tcp_stream_rx) = mpsc::channel(DEFAULT_CHANNEL_BUFFER_SIZE);
-        let (udp_socket_tx, udp_socket_rx) = mpsc::channel(DEFAULT_CHANNEL_BUFFER_SIZE);
-
-        (Self {
-            port,
-            ip_addr,
-            tcp_listener: Arc::new(RwLock::new(None)),
-            udp_socket: Arc::new(RwLock::new(None)),
-            dial_timeout,
-            tcp_stream_tx: tcp_stream_tx.clone(),
-            udp_socket_tx: udp_socket_tx.clone(),
-            tcp_connections: Arc::new(Mutex::new(Vec::new())),
-            tcp_messages: Arc::new(Mutex::new(Vec::new())),
-            udp_messages: Arc::new(Mutex::new(Vec::new())),
-            tcp_dial_results: Arc::new(Mutex::new(VecDeque::new())),
-        },
-        TransportChannel {
-            tcp_stream_rx,
-            udp_socket_rx,
-        })
-    }
-
-    pub async fn get_tcp_connections(&self) -> Vec<SocketAddr> {
-        self.tcp_connections.lock().await.clone()
-    }
-
-    pub async fn get_tcp_messages(&self) -> Vec<(SocketAddr, Vec<u8>)> {
-        self.tcp_messages.lock().await.clone()
-    }
-
-    pub async fn get_udp_messages(&self) -> Vec<(SocketAddr, Vec<u8>)> {
-        self.udp_messages.lock().await.clone()
-    }
-
-    pub async fn get_last_udp_message(&self) -> Option<(SocketAddr, Vec<u8>)> {
-        let messages =  self.udp_messages.lock().await;
-        if messages.len() == 0 {
-            return None;
+impl MockDatagramTransport {
+    pub fn new(local_addr: SocketAddr) -> Self {
+        let (datagram_tx, _) = broadcast::channel(100);
+        Self {
+            incoming_queue: Arc::new(Mutex::new(VecDeque::new())),
+            outgoing_queue: Arc::new(Mutex::new(VecDeque::new())),
+            datagram_tx,
+            local_addr,
         }
-        Some(messages[messages.len()-1].clone())
     }
 
-    pub async fn set_next_tcp_dial_result(&self, result: Result<TcpStream>) {
-        self.tcp_dial_results.lock().await.push_back(result);
+    pub async fn inject_datagram(&self, datagram: Datagram) {
+        self.incoming_queue.lock().await.push_back(datagram.clone());
+        let _ = self.datagram_tx.send(datagram);
     }
 
-    pub async fn clear(&self) {
-        self.tcp_connections.lock().await.clear();
-        self.tcp_messages.lock().await.clear();
-        self.udp_messages.lock().await.clear();
-        self.tcp_dial_results.lock().await.clear();
+    pub async fn get_sent_datagrams(&self) -> Vec<(SocketAddr, Vec<u8>)> {
+        self.outgoing_queue.lock().await.drain(..).collect()
     }
 }
 
 #[async_trait]
-impl NodeTransport for MockTransport {
-    fn port(&self) -> u16 {
-        self.port
+impl DatagramTransport for MockDatagramTransport {
+    fn incoming(&self) -> broadcast::Receiver<Datagram> {
+        self.datagram_tx.subscribe()
     }
 
-    fn ip_addr(&self) -> IpAddr {
-        self.ip_addr
-    }
-
-    async fn dial_tcp(&self, addr: SocketAddr) -> Result<TcpStream> {
-        self.tcp_connections.lock().await.push(addr);
-        self.tcp_dial_results
-            .lock()
-            .await
-            .pop_front()
-            .unwrap_or_else(|| Err(anyhow!("No more mock TCP dial results")))
-    }
-
-    async fn write_to_tcp(&self, stream: &mut TcpStream, message: &[u8]) -> Result<()> {
-        let peer_addr = stream.peer_addr()?;
-        self.tcp_messages
-            .lock()
-            .await
-            .push((peer_addr, message.to_vec()));
+    async fn send_to(&self, target: SocketAddr,data: &[u8]) ->  Result<(), Box<dyn Error + Send + Sync>> {
+        self.outgoing_queue.lock().await.push_back((target, data.to_vec()));
         Ok(())
     }
 
-    async fn write_to_udp(&self, addr: SocketAddr, message: &[u8]) -> Result<()> {
-        if message.len() > MAX_UDP_PACKET_SIZE {
-            return Err(anyhow!("Message too large for UDP packet"));
-        }
-        self.udp_messages
-            .lock()
-            .await
-            .push((addr, message.to_vec()));
+    fn local_addr(&self) -> Result<SocketAddr, Box<dyn Error + Send + Sync>>{
+        Ok(self.local_addr)
+    }
+
+    async fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
-    }
-
-    async fn tcp_stream_listener(&self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn udp_socket_listener(&self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn bind_tcp_listener(&self) -> Result<()> {
-        *self.tcp_listener.write() = Some(Arc::new(()));
-        Ok(())
-    }
-
-    async fn bind_udp_socket(&self) -> Result<()> {
-        *self.udp_socket.write() = Some(Arc::new(()));
-        Ok(())
-    }
-
-    fn tcp_stream_tx(&self) -> mpsc::Sender<NetworkTcpStream> {
-        self.tcp_stream_tx.clone()
-    }
-
-    fn udp_socket_tx(&self) -> mpsc::Sender<NetworkUdpSocket> {
-        self.udp_socket_tx.clone()
     }
 }
 
@@ -160,5 +68,43 @@ pub(crate) fn create_mock_node(name: &str, ip: &str, port: u16, state: NodeState
         0,
         DefaultMetadata::default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[tokio::test]
+    async fn test_mock_datagram_transport() {
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000);
+        let mock_transport = MockDatagramTransport::new(local_addr);
+
+        // Test incoming
+        let mut rx = mock_transport.incoming();
+        
+        let test_datagram = Datagram {
+            remote_addr: "127.0.0.1:9000".parse().unwrap(),
+            data: vec![1, 2, 3],
+        };
+        mock_transport.inject_datagram(test_datagram.clone()).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.remote_addr, test_datagram.remote_addr);
+        assert_eq!(received.data, test_datagram.data);
+
+        // Test send_to
+        let target = "127.0.0.1:9001".parse().unwrap();
+        let data = vec![4, 5, 6];
+        mock_transport.send_to(target, &data).await.unwrap();
+
+        let sent = mock_transport.get_sent_datagrams().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, target);
+        assert_eq!(sent[0].1, data);
+
+        // Test local_addr
+        assert_eq!(mock_transport.local_addr().unwrap(), local_addr);
+    }
 }
 
