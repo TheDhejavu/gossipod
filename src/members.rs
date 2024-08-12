@@ -6,9 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use dashmap::DashMap;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
-
 use crate::node::{Node, NodeMetadata, NodePriority};
 use crate::state::NodeState;
 
@@ -37,7 +34,7 @@ pub(crate) struct MergeResult {
 }
 
 impl<M: NodeMetadata> Membership<M> {
-    /// Creates a new, empty Membership list.
+    ///  Creates a new, empty [`Membership`] list.
     pub(crate) fn new() -> Self {
         Self {
             nodes: Arc::new(DashMap::new()),
@@ -53,7 +50,7 @@ impl<M: NodeMetadata> Membership<M> {
         self.nodes.insert(name.clone(), node);
 
         // Here we are setting last_piggybacked to UNIX_EPOCH (January 1, 1970), 
-        // and we're effectively saying this node has never been probed before by
+        // and we're effectively saying this node has never been piggybacked before by
         // giving it the oldest possible timestamp.
         let mut priority_queue = self.nodes_priority_queue.write();
         priority_queue.push(Reverse(NodePriority {

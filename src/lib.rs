@@ -1,7 +1,10 @@
+use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
 use codec::MessageCodec;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+use tokio::macros::support::poll_fn;
 pub use broadcast_queue::{BroadcastQueue, DefaultBroadcastQueue};
 pub use  dispatch_event_handler::DispatchEventHandler;
 use rand::{thread_rng, Rng};
@@ -9,16 +12,18 @@ use config::{BROADCAST_FANOUT, INDIRECT_REQ, MAX_UDP_PACKET_SIZE};
 use event_scheduler::{EventState, EventType};
 use log::*;
 use members::MergeAction;
-use message::{AckPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
+use message::{AckPayload, AppMsgPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
 pub use node::{DefaultMetadata, NodeMetadata};
+use std::pin::pin;
 use tokio::sync::broadcast;
 use parking_lot::RwLock;
 use tokio::time::{self, Instant};
 use tokio_util::bytes::{BufMut, BytesMut};
 use tokio_util::codec::Encoder;
-use transport::Datagram;
+use transport::{Datagram, ListenerEvent, TcpConnectionListener};
 use utils::pretty_debug;
-use std::net::SocketAddr;
+use std::net::{SocketAddr};
+use tokio::net::{TcpStream};
 use std::time::Duration;
 use crate::{
     config::GossipodConfig,
@@ -208,6 +213,8 @@ where
      ) -> Result<Self> {
     
         let (shutdown_tx, _) = broadcast::channel(1);
+        let addr = transport.local_addr()?;
+
         let swim = Self {
             inner: Arc::new(InnerGossipod {
                 config,
@@ -235,6 +242,7 @@ where
         self.set_local_node_liveness().await?;
 
         self.launch_datagram_listener().await?;
+        self.launch_tcp_listener().await?;
         
         let probe_handle = self.launch_probe_scheduler(self.inner.shutdown.subscribe());
         let gossip_handle = self.launch_gossip_scheduler(self.inner.shutdown.subscribe());
@@ -255,7 +263,7 @@ where
 
         self.set_state(GossipodState::Stopped).await?;
         self.inner.transport.shutdown().await?;
-        // self.leave().await?;
+        self.leave().await?;
 
         info!("> [GOSSIPOD] Gracefully shut down due to {:?}", shutdown_reason);
     
@@ -322,7 +330,7 @@ where
                             return;
                         }
 
-                        if backoff.is_circuit_open() {
+                        if backoff.is_circuit_open().unwrap_or(false)  {
                             warn!("Circuit is open. Waiting before next probe attempt.");
                             time::sleep(backoff.reset_timeout).await;
                             return;
@@ -340,9 +348,10 @@ where
                             }
                             Err(e) => {
                                 error!("Probe error: {}", e);
-                                let (failures, circuit_opened) = backoff.record_failure();
-                                if circuit_opened {
-                                    warn!("Circuit breaker opened after {} consecutive failures", failures);
+                                if let Ok((failures, circuit_opened)) = backoff.record_failure(){
+                                    if circuit_opened {
+                                        warn!("Circuit breaker opened after {} consecutive failures", failures);
+                                    }
                                 }
                             }
                         }
@@ -444,7 +453,7 @@ where
                             return;
                         }
 
-                        if backoff.is_circuit_open() {
+                        if backoff.is_circuit_open().unwrap_or(false) {
                             warn!("Circuit is open. Waiting before next gossip attempt.");
                             time::sleep(backoff.reset_timeout).await;
                             return;
@@ -460,9 +469,10 @@ where
                             }
                             Err(e) => {
                                 error!("Gossip error: {}", e);
-                                let (failures, circuit_opened) = backoff.record_failure();
-                                if circuit_opened {
-                                    warn!("Circuit breaker opened after {} consecutive failures", failures);
+                                if let Ok((failures, circuit_opened)) = backoff.record_failure(){
+                                    if circuit_opened {
+                                        warn!("Circuit breaker opened after {} consecutive failures", failures);
+                                    }
                                 }
                             }
                         }
@@ -526,19 +536,32 @@ where
         let local_node = self.get_local_node().await?;
         let local_addr = local_node.socket_addr()?;
 
-        // self.inner.net_svc.message_target(target, local_addr, msg).await?;
+        let message_payload = AppMsgPayload {data: msg.to_vec()};
+        let message = Message {
+            msg_type: MessageType::AppMsg,
+            payload: MessagePayload::AppMsg(message_payload),
+            sender: local_addr,
+        };
+
+        let mut codec = MessageCodec::new();
+        let mut buffer = BytesMut::new();
+        codec.encode(message, &mut buffer)?;
+
+        let mut stream = TcpStream::connect(target).await?;
+        stream.write_all( &buffer).await?;
+
         Ok(())
     }
 
     /// Gossipod PROBE - Probes randomly selected nodes
     ///
-    /// This function implements the probing mechanism of the gossip protocol:
+    /// Probe implements the probing mechanism of the gossip protocol:
     /// 1. Selects a random node to probe, excluding the local node and dead nodes.
     /// 2. Sends a Ping message to the selected node.
     /// 3. Waits for an ACK response or a timeout.
     /// 4. Handles the response: updates node state or marks the node as suspect if no response.
     ///
-    /// The function uses a combination of direct UDP messaging and an event-based
+    /// It a combination of direct UDP messaging and an event-based
     /// system to handle asynchronous responses. If the direct UDP message fails,
     /// it falls back to indirect pinging through other nodes.
     pub(crate) async fn probe(&self) -> Result<()> {
@@ -966,7 +989,7 @@ where
                     ack_deadline,
                 ).await?;
 
-                // Send the UDP PING-REQ message.
+                // Send the PING-REQ message.
                 if let Err(e) = self.inner.transport.send_to(original_target, &message_bytes).await {
                     error!("[ERR] Failed to send UDP PING-REQ: {}", e);
                     return Ok(());
@@ -1015,7 +1038,7 @@ where
     async fn handle_ack(&self, message_payload: MessagePayload) -> Result<()> {
         match message_payload {
             MessagePayload::Ack(payload) => {
-                let _ = self.inner.event_scheduler.try_intercept_event(&EventType::Ack{
+                let _ = self.inner.event_scheduler.intercept_event(&EventType::Ack{
                     sequence_number: payload.sequence_number
                 }).await;
             
@@ -1240,7 +1263,7 @@ where
 
     pub(crate) async fn integrate_new_node(&self, member: RemoteNode) -> Result<()> {
         debug!(">>>> Integrate new node");
-        let _ = self.inner.event_scheduler.try_intercept_event(&EventType::SuspectTimeout{node: member.name.clone()}).await;
+        let _ = self.inner.event_scheduler.intercept_event(&EventType::SuspectTimeout{node: member.name.clone()}).await;
 
         let metadata = M::from_bytes(&member.metadata)
             .context("Failed to deserialize node metadata")?;
@@ -1422,9 +1445,6 @@ where
     // Update Node liveness is responsible for handling ALIVE node when an ALIVE Broadcast received
     // it uses the central membership merge funciton to resolve conflicting data and return merge result accordingly
     pub(crate) async fn update_node_liveness(&self, incarnation: u64, member: &str) -> Result<()> {
-        debug!(">> {}", pretty_debug("Membership:", &self.inner.members.get_all_nodes()?));
-
-
         match self.inner.members.get_node(member)? {
             Some(node) => {
                 let mut alive_node = node.clone();
@@ -1496,11 +1516,6 @@ where
             .context("failed to send join broadcast to initial contact")?;
 
         self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
-        // debug!(
-        //     "{}", 
-        //     pretty_debug("Membership:", &self.inner.members.get_all_nodes()?),
-        // );
-
         Ok(())
     }
 
@@ -1680,6 +1695,82 @@ where
     
         Ok(())
     }
+
+    async fn launch_tcp_listener(&self) -> Result<()> {
+        if self.inner.config.disable_tcp {
+            return Ok(());
+        }
+        let addr = self.inner.transport.local_addr()?;
+        let tcp_listener = TcpConnectionListener::bind(addr).await?;
+        let mut shutdown_rx = self.inner.shutdown.subscribe();
+        let gossipod = self.clone();
+    
+        tokio::task::spawn(async move {
+            let mut listener = pin!(tcp_listener);
+            loop {
+                tokio::select! {
+                    event = poll_fn(|cx| listener.as_mut().poll(cx)) => {
+                        match event {
+                            ListenerEvent::Incoming { stream, remote_addr } => {
+                                debug!("Accepted TCP connection from {}", remote_addr);
+                                tokio::spawn(Self::handle_tcp_connection(gossipod.clone(), stream, remote_addr));
+                            }
+                            ListenerEvent::ListenerClosed { local_addr } => {
+                                warn!("TCP listener closed on {}", local_addr);
+                                break;
+                            }
+                            ListenerEvent::Error(err) => {
+                                error!("TCP listener error: {}", err);
+                                // TODO: Implement backoff strategy here if needed
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        info!("Received shutdown signal, stopping TCP listener");
+                        break;
+                    }
+                }
+            }
+            info!("TCP listener stopped");
+        });
+        Ok(())
+    }
+    
+    async fn handle_tcp_connection(gossipod: Gossipod<M>, mut stream: TcpStream, remote_addr: SocketAddr) {
+        let mut buffer = [0; 1024];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) => {
+                    info!("TCP connection closed by {}", remote_addr);
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(e) = Self::process_tcp_stream(&gossipod, &buffer[..n], &mut stream, remote_addr).await {
+                        error!("Error processing TCP message from {}: {}", remote_addr, e);
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading from TCP stream {}: {}", remote_addr, e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Processes a stream over TCP
+    async fn process_tcp_stream(gossipod: &Gossipod<M>, data: &[u8], stream: &mut TcpStream, remote_addr: SocketAddr) -> Result<()> {
+        let message = Message::from_vec(data)
+                    .context("Failed to decode message")?;
+
+        match message.msg_type {
+            MessageType::AppMsg => gossipod.handle_app_msg(message.sender, message.payload).await,
+            _ => {
+                warn!("[ERR] Unexpected message type {} for TCP from {}", message.msg_type, remote_addr);
+                Ok(())
+            }
+        }
+    }
+    
     pub async fn stop(&self) -> Result<()> {
         let mut state = self.inner.state.write();
         match *state {
@@ -1725,6 +1816,7 @@ mod tests {
         let config = GossipodConfigBuilder::new()
             .name(name.to_string())
             .port(port)
+            .disable_tcp(true)
             .build()
             .await?;
 
@@ -1862,7 +1954,6 @@ mod tests {
 
         // Check that an ACK was sent back to the intermediate node
         let sent_datagrams = mock_transport.get_sent_datagrams().await;
-        println!("Data: {}", sent_datagrams.len());
         assert!(sent_datagrams.len() >= 1, "ACK was not sent");
 
         let (addr, message_bytes) = &sent_datagrams[sent_datagrams.len() - 1];

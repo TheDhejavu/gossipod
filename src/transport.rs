@@ -1,3 +1,4 @@
+use pin_project::pin_project;
 use tokio::{sync::broadcast, time};
 use anyhow::{Result, Context};
 use async_trait::async_trait;
@@ -5,7 +6,14 @@ use std::{net::IpAddr, sync::Arc, time::Duration};
 use tokio::net::UdpSocket;
 use std::net::SocketAddr;
 use log::*;
+use std::{
+    io,
+    pin::Pin,
+    task::{Context as TaskContext, Poll},
+};
 
+use futures::{ready, Stream};
+use tokio::net::{TcpListener, TcpStream};
 use crate::{backoff::BackOff, config::{DEFAULT_CHANNEL_BUFFER_SIZE, DEFAULT_IP_ADDR}, ip_addr::IpAddress};
 
 #[derive(Debug, Clone)]
@@ -33,8 +41,7 @@ impl DefaultTransport {
     pub async fn new(ip_addr: IpAddr, port: u16) -> Result<Self> {
         let addr = SocketAddr::new(ip_addr, port);
         let udp_socket = UdpSocket::bind(addr).await.context("Failed to bind UDP socket")?;
-        let local_addr = udp_socket.local_addr().context("Failed to get local address")?;
-
+    
         let (datagram_tx, _) = broadcast::channel(DEFAULT_CHANNEL_BUFFER_SIZE);
         let (shutdown_signal, _) = broadcast::channel(1);
 
@@ -49,7 +56,7 @@ impl DefaultTransport {
         let private_ip_addr = IpAddress::find_system_ip()?;
         if addr.ip().to_string() == DEFAULT_IP_ADDR || addr.ip().to_string() == "0.0.0.0" {
             info!(
-                "> [GOSSIPOD] Binding to all network interfaces: {}:{} (Private IP: {}:{})",
+                "> [UDP] Binding to all network interfaces: {}:{} (Private IP: {}:{})",
                 addr.ip(),
                 addr.port(),
                 private_ip_addr.to_string(),
@@ -57,7 +64,7 @@ impl DefaultTransport {
             );
         } else {
             info!(
-                "> [GOSSIPOD] Binding to specific IP: {}:{}",
+                "> [UDP] Binding to specific IP: {}:{}",
                 addr.ip(),
                 addr.port(),
             );
@@ -78,7 +85,7 @@ impl DefaultTransport {
             let mut buf = vec![0u8; 65535];
             loop {
                
-                if backoff.is_circuit_open() {
+                if backoff.is_circuit_open().unwrap_or(false) {
                     let wait_time = backoff.time_until_open()
                         .unwrap_or(Duration::from_secs(2)); 
                     
@@ -86,7 +93,7 @@ impl DefaultTransport {
                     
                     tokio::select! {
                         _ = time::sleep(wait_time) => {
-                            if backoff.is_circuit_open() {
+                            if backoff.is_circuit_open().unwrap_or(false) {
                                 warn!("Circuit breaker is still open after waiting. Will retry.");
                             } else {
                                 info!("Circuit breaker has closed. Resuming normal operation.");
@@ -118,8 +125,9 @@ impl DefaultTransport {
                                 }
                             }
                             Err(e) => {
-                                let (failures, _) = backoff.record_failure();
-                                error!("Error receiving UDP datagram: {} Consecutive failures: {}", e, failures);
+                                if let Ok((failures, _)) = backoff.record_failure(){
+                                    error!("Error receiving UDP datagram: {} Consecutive failures: {}", e, failures);
+                                }
                             }
                         }
                     }
@@ -160,5 +168,83 @@ impl DatagramTransport for DefaultTransport {
         self.shutdown_signal.send(())
             .map_err(|_| anyhow::anyhow!("Failed to send shutdown signal"))?;
         Ok(())
+    }
+}
+
+#[pin_project]
+#[derive(Debug)]
+pub(crate) struct TcpConnectionListener {
+    local_addr: SocketAddr,
+    #[pin]
+    incoming: TcpListenerStream,
+}
+
+impl TcpConnectionListener {
+    pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+
+        info!(
+            "> [TCP] Binding to specific IP: {}:{}",
+            addr.ip(),
+            addr.port(),
+        );
+
+        Ok(Self::new(listener, local_addr))
+    }
+
+    pub(crate) const fn new(listener: TcpListener, local_addr: SocketAddr) -> Self {
+        Self {
+            local_addr,
+            incoming: TcpListenerStream { inner: listener },
+        }
+    }
+
+    pub(crate) fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<ListenerEvent> {
+        let this = self.project();
+        match ready!(this.incoming.poll_next(cx)) {
+            Some(Ok((stream, remote_addr))) => {
+                if let Err(err) = stream.set_nodelay(true) {
+                    warn!(target: "net", "set nodelay failed: {:?}", err);
+                }
+                Poll::Ready(ListenerEvent::Incoming { stream, remote_addr })
+            }
+            Some(Err(err)) => Poll::Ready(ListenerEvent::Error(err)),
+            None => Poll::Ready(ListenerEvent::ListenerClosed {
+                local_addr: *this.local_addr,
+            }),
+        }
+    }
+
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
+pub(crate) enum ListenerEvent {
+    Incoming {
+        stream: TcpStream,
+        remote_addr: SocketAddr,
+    },
+    ListenerClosed {
+        local_addr: SocketAddr,
+    },
+    Error(io::Error),
+}
+
+#[derive(Debug)]
+struct TcpListenerStream {
+    inner: TcpListener,
+}
+
+impl Stream for TcpListenerStream {
+    type Item = io::Result<(TcpStream, SocketAddr)>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.poll_accept(cx) {
+            Poll::Ready(Ok(conn)) => Poll::Ready(Some(Ok(conn))),
+            Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

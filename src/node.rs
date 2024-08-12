@@ -229,7 +229,7 @@ pub struct Node<M> {
 
 impl<M: NodeMetadata> Node<M> {
   
-    /// Creates a new `Node` with the given IP address, port, name, and metadata.
+    /// Creates a new [`Node`] with the given IP address, port, name, and metadata.
     pub fn new(ip_addr: IpAddr, port: u16, name: String, incarnation: u64, metadata: M) -> Self {
         Self {
             ip_addr,

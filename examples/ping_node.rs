@@ -66,7 +66,6 @@ impl<M: NodeMetadata> DispatchEventHandler<M> for EventHandler {
     }
 }
 
-
 impl SwimNode {
     async fn new(args: &Args) -> Result<Self> {
         let config = GossipodConfigBuilder::new()

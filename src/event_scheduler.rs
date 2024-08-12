@@ -12,7 +12,8 @@ pub(crate) enum EventType {
     SuspectTimeout { node: String },
 }
 
-/// Represents the current state of a scheduled event in the EventScheduler.
+// EVENT-LIFECYCLE
+/// [`EventState`] Represents the current state of a scheduled event in the EventScheduler.
 ///
 /// The lifecycle of an event typically progresses as follows:
 /// 1. An event is initially created in the `Pending` state.
@@ -133,6 +134,7 @@ impl EventScheduler {
     }
 
     /// Calculates the duration until the next event is due.
+    /// 
     /// Returns the duration if an event is found, or None if there are no events.
     pub(crate) async fn time_to_next_event(&self) -> Option<Duration> {
         let now = Instant::now();
@@ -148,6 +150,7 @@ impl EventScheduler {
     }
 
     /// Retrieves a limited number of events that are due up to the current time.
+    /// 
     /// Returns a vector of event types and event details that reached it's deadline
     pub(crate) async fn next_events(&self, limit: usize) -> Vec<(EventType, Event)> {
         let now = Instant::now();
@@ -204,8 +207,9 @@ impl EventScheduler {
     }
     
     /// Intercepts a specified event, changing its state to Intercepted.
+    /// 
     /// Removes the event from both the event map and the event heap.
-    pub(crate) async fn try_intercept_event(&self, event_type: &EventType) -> Result<()> {
+    pub(crate) async fn intercept_event(&self, event_type: &EventType) -> Result<()> {
         let mut event_map = self.event_map.write().await;
         
         if let Some((id, event)) = event_map.remove(event_type) {
@@ -219,9 +223,20 @@ impl EventScheduler {
         }
     }
 
-    /// Cancels a specified event by intercepting it.
+    /// Cancels a specified event before it reaches deadline, this can be use for a different case
+    /// where intercept_event is not ideal.
     pub(crate) async fn cancel_event(&self, event_type: &EventType) -> Result<()> {
-        self.try_intercept_event(event_type).await
+        let mut event_map = self.event_map.write().await;
+        
+        if let Some((id, event)) = event_map.remove(event_type) {
+            event.sender.send(EventState::Cancelled).await?;
+            // Remove the event from the events heap as well
+            let mut events = self.events.write().await;
+            events.retain(|&(_, ref e_id)| e_id != &id);
+            Ok(())
+        } else {
+            Err(anyhow!("Event not found"))
+        }
     }
 }
 
@@ -254,7 +269,7 @@ mod tests {
         
         let (mut receiver, _) = manager.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await.unwrap();
         
-        manager.try_intercept_event(&event_type).await.unwrap();
+        manager.intercept_event(&event_type).await.unwrap();
         
         let result = timeout(Duration::from_millis(100), receiver.recv()).await;
         assert!(result.is_ok());

@@ -84,6 +84,8 @@ pub struct GossipodConfig {
     /// The time window during which supposedly dead nodes are still included in gossip,
     /// allowing them an opportunity to refute their dead status if they're actually alive.
     pub(crate) dead_node_gossip_window: Duration,
+
+    pub(crate) disable_tcp: bool,
 }
 
 impl Clone for GossipodConfig {
@@ -100,6 +102,7 @@ impl Clone for GossipodConfig {
             network_type: self.network_type.clone(),
             initial_cluster_size: self.initial_cluster_size,
             dead_node_gossip_window: self.dead_node_gossip_window,
+            disable_tcp: self.disable_tcp,
         }
     }
 }
@@ -184,6 +187,7 @@ pub struct GossipodConfigBuilder {
     pub(crate) network_type: NetworkType,
     pub(crate) initial_cluster_size: usize,
     pub(crate) dead_node_gossip_window: Duration,
+    pub(crate) disable_tcp: bool,
 }
 
 impl Default for GossipodConfigBuilder {
@@ -202,6 +206,7 @@ impl Default for GossipodConfigBuilder {
             network_type: NetworkType::default(),
             base_gossip_interval:  Duration::from_millis(DEFAULT_BASE_GOSSIP_INTERVAL),
             initial_cluster_size: 1,
+            disable_tcp: false,
             dead_node_gossip_window:  Duration::from_millis(DEFAULT_DEAD_NODE_GOSSIP_WINDOW),
         }
     }
@@ -234,6 +239,11 @@ impl GossipodConfigBuilder {
     /// Sets initial cluster size
     pub fn cluster_size(mut self, cluster_size: usize) -> Self {
         self.initial_cluster_size = cluster_size;
+        self
+    }
+
+    pub fn disable_tcp(mut self, disable: bool) -> Self {
+        self.disable_tcp = disable;
         self
     }
 
@@ -337,6 +347,7 @@ impl GossipodConfigBuilder {
             base_suspicious_timeout: self.base_suspicious_timeout,
             network_type: self.network_type,
             initial_cluster_size: self.initial_cluster_size,
+            disable_tcp: self.disable_tcp,
             dead_node_gossip_window: self.dead_node_gossip_window,
         })
     }

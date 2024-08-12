@@ -27,4 +27,5 @@ dashmap = "6.0.1"
 parking_lot = "0.12.3"
 bytes = "1.7.1"
 rand = "0.8.5"
+pin-project = "1.1.5"
 
