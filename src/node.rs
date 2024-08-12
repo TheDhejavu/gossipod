@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
-use log::warn;
+use tracing::warn;
 use serde::{Serialize, Deserialize};
 use sysinfo::System;
 use std::cmp::Ordering;

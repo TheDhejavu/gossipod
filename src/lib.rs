@@ -12,7 +12,7 @@ pub use  dispatch_event_handler::DispatchEventHandler;
 use rand::{thread_rng, Rng};
 use config::{BROADCAST_FANOUT, INDIRECT_REQ, MAX_UDP_PACKET_SIZE};
 use event_scheduler::{EventState, EventType};
-use log::*;
+use tracing::{info, warn, error, debug, instrument};
 use members::MergeAction;
 use message::{AckPayload, AppMsgPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
 pub use node::{DefaultMetadata, NodeMetadata};
@@ -233,9 +233,9 @@ where
 
         Ok(swim)
     }
-
+    #[instrument(skip(self))]
     pub async fn start(&self) -> Result<()> {
-        info!("> [GOSSIPOD] Server Started with `{}`", self.inner.config.name);
+        info!(name = %self.inner.config.name, "[GOSSIPOD] Server Started");
         let shutdown_rx = self.inner.shutdown.subscribe();
 
         self.set_state(GossipodState::Running).await?;
@@ -1798,13 +1798,6 @@ mod tests {
     use crate::message::{Broadcast, MessagePayload};
     use std::time::Duration;
 
-    fn init() {
-        let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Debug)
-            .is_test(true)
-            .try_init();
-    }
-
     async fn create_test_gossipod(name: &str, port: u16) -> Result<(Gossipod<DefaultMetadata>, Arc<MockDatagramTransport>)> {
         let config = GossipodConfigBuilder::new()
             .name(name.to_string())
@@ -1828,7 +1821,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_suspect_refutation() -> Result<()> {
-        init();
         let (gossipod, mock_transport) = create_test_gossipod("local_node", 8000).await?;
 
         // Add local node to membership
@@ -1887,7 +1879,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ping_req_process() -> Result<()> {
-        init();
         
         let (gossipod, mock_transport) = create_test_gossipod("local_node", 8000).await?;
 

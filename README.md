@@ -80,7 +80,6 @@ sequenceDiagram
     end
 ```
 
-
 ### Quick Demo
 To see Gossipod in action, check out the [`./examples`](https://github.com/TheDhejavu/gossipod/tree/feat/configurable-support/examples) directory, which
 includes a number of demos. Below you can run two different instances of gossipod specifiying different port address and node name

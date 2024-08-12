@@ -6,7 +6,7 @@ use std::{net::IpAddr, sync::Arc, time::Duration};
 use tokio::net::UdpSocket;
 use std::net::SocketAddr;
 use std::error::Error;
-use log::*;
+use tracing::{info, warn, error, debug};
 use std::{
     io,
     pin::Pin,

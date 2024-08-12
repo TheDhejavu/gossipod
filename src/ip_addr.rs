@@ -41,7 +41,6 @@ impl IpAddress {
         let networks = Networks::new_with_refreshed_list();
         for (_, data) in &networks {
             for ip in data.ip_networks() {
-                println!("DR {}", ip.addr);
                 if let IpAddr::V4(ipv4) = ip.addr {
                     if !ipv4.is_loopback() {
                         return Ok(IpAddr::V4(ipv4));

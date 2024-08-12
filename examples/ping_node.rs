@@ -7,11 +7,15 @@ use anyhow::{Context, Result};
 
 use async_trait::async_trait;
 use gossipod::{config::{GossipodConfigBuilder, NetworkType}, DispatchEventHandler, Gossipod, Node, NodeMetadata};
-use log::*;
+use tracing::{info, error};
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self};
 use tokio::time;
 use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
 const NODE_NAME: &str = "NODE_1";
 const BIND_PORT: u16 = 7948;
@@ -182,14 +186,27 @@ struct Args {
     join_addr: Option<String>,
 }
 
+
+fn setup_tracing() {
+    let fmt_layer = fmt::layer()
+        .with_target(true)
+        .with_ansi(true)
+        .with_level(true);
+
+    let filter_layer = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("debug"));
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .init();
+}
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    env_logger::Builder::new()
-        .filter_level(::log::LevelFilter::Info) 
-        .filter_level(::log::LevelFilter::Debug)
-        .init();
+    setup_tracing();
 
     let mut node = SwimNode::new(&args).await?;
     node.start().await?;
