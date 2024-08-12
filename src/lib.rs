@@ -671,9 +671,24 @@ where
             indirect_ack_deadline,
         ).await?;
 
+        // Wait for Resonse before suspecting Node of Failure if we do not get a response
+        // before events reaches deadline. 
         tokio::select! {
             event_state = rx.recv() => {
-                self.handle_indirect_ack_response(event_state, node).await?;
+                match event_state {
+                    Some(EventState::Intercepted) => {
+                        debug!("[ERR] Received ACK for probe to node {}", node.name);
+                    },
+                    Some(EventState::ReachedDeadline) => {
+                        self.handle_suspect_node(node).await?;
+                    },
+                    Some(other_state) => {
+                        warn!("Unexpected event state: {:?}", other_state);
+                    },
+                    None => {
+                        warn!("ERR] Event channel closed unexpectedly for node {}", node.name);
+                    }
+                }
             },
             _ = tokio::time::sleep_until(probe_deadline) => {
                 warn!("Probing deadline reached for node {}, proceeding to the next cycle.", node.name);
@@ -681,28 +696,6 @@ where
             }
         }
 
-        Ok(())
-    }
-
-    async fn handle_indirect_ack_response(
-        &self,
-        event_state: Option<EventState>,
-        node: Node<M>,
-    ) -> Result<()> {
-        match event_state {
-            Some(EventState::Intercepted) => {
-                debug!("[ERR] Received ACK for probe to node {}", node.name);
-            },
-            Some(EventState::ReachedDeadline) => {
-                self.handle_suspect_node(node).await?;
-            },
-            Some(other_state) => {
-                warn!("Unexpected event state: {:?}", other_state);
-            },
-            None => {
-                warn!("ERR] Event channel closed unexpectedly for node {}", node.name);
-            }
-        }
         Ok(())
     }
 
@@ -748,7 +741,7 @@ where
             let message_bytes = self.encode_message_with_piggybacked_updates(ping_req.clone()).await?;
     
             if let Err(e) = self.inner.transport.send_to(node.socket_addr()?, &message_bytes).await {
-                warn!("[ERR] Failed to send indirect ping to {} for target {}: {}", node.name, target, e);
+                debug!("[ERR] Failed to send indirect ping to {} for target {}: {}", node.name, target, e);
             } else {
                 debug!("[INFO] Sent indirect ping to {} for target {}", node.name, target);
             }

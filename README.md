@@ -4,7 +4,7 @@
 ![minimum rustc 1.81](https://img.shields.io/badge/rustc-1.81.0+-red.svg)
 ![GitHub](https://img.shields.io/github/license/thedhejavu/gossipod)
 
-Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Membership Protocol) implementation written in Rust.
+Asynchronous Scalable Weakly-consistent Infection-style Process Group Membership Protocol(SWIM) implementation written in Rust.
 
 > [!WARNING]
 > **Disclaimer:** This project is a work in progress and not yet production-ready.
@@ -13,7 +13,7 @@ Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Me
 
 
 - Research Paper: [Swim](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
-- Examples: [Consistent Hashing](https://github.com/TheDhejavu/gossipod-examples/tree/main/hashring) | [QUIC](https://github.com/TheDhejavu/gossipod-examples/tree/main/quic) 
+- Examples: [Consistent Hashing](https://github.com/TheDhejavu/gossipod-examples/tree/main/hashring) | [QUIC](https://github.com/TheDhejavu/gossipod-examples/tree/main/quic) | [PING-PONG](https://github.com/TheDhejavu/gossipod/tree/main/examples)
 
 ## Proposed Key Features
 
