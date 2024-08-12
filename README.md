@@ -12,7 +12,7 @@ Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Me
 > Use with caution. Feedback and contributions welcome, Thanks!.
 
 
-- [Swim Research Paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
+- Research Paper: [Swim](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
 - Examples: [Consistent Hashing](https://github.com/TheDhejavu/gossipod-examples/tree/main/hashring) | [QUIC](https://github.com/TheDhejavu/gossipod-examples/tree/main/quic) 
 
 ## Proposed Key Features
