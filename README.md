@@ -33,7 +33,7 @@ Asynchronous Scalable Weakly-consistent Infection-style Process Group Members
 
 ## SWIM implementation for Gossipod In a nutshell
 
-Gossipod employs 3 types of messages: `PING`, `PING-REQ`, and `ANNOUNCE` (which includes `JOIN`, `LEAVE`, `SUSPECT`, `ALIVE`, and `CONFIRM` subtypes). The `PING` and `PING-REQ` messages are central to the system's failure detection mechanism base-off SWIM, facilitating constant state exchange by piggybacking information dissemination on this process. When a state change occurs, either through voluntary requests or regular failure detection, the system uses `BROADCAST` messages for random dissemination of this information. Each node in the network maintains an incarnation number, starting at zero, which can only be incremented by the node itself. This number is crucial for managing the node's state in other nodes' local membership lists and serves as a means to refute suspicions `(SWIM+Inf.+Susp.)` from other nodes. This design allows Gossipod to achieve efficient and resilient distributed state management and failure detection in a distributed or decentralized network, balancing the needs for up-to-date information, conflict resolution, and system reliability.
+Gossipod employs 3 types of messages: `PING`, `PING-REQ`, and `BROADCAST` (which includes `JOIN`, `LEAVE`, `SUSPECT`, `ALIVE`, and `CONFIRM` subtypes). The `PING` and `PING-REQ` messages are central to the system's failure detection mechanism base-off SWIM, facilitating constant state exchange by piggybacking information dissemination on this process. When a state change occurs, either through voluntary requests or regular failure detection, the system uses `BROADCAST` messages for random dissemination of this information. Each node in the network maintains an incarnation number, starting at zero, which can only be incremented by the node itself. This number is crucial for managing the node's state in other nodes' local membership lists and serves as a means to refute suspicions `(SWIM+Inf.+Susp.)` from other nodes. This design allows Gossipod to achieve efficient and resilient distributed state management and failure detection in a distributed or decentralized network, balancing the needs for up-to-date information, conflict resolution, and system reliability.
 
 By Extension, [Lifeguard](https://arxiv.org/pdf/1707.00788) offers additional implementation features that are not yet incorporated into the current version of Gossipod which are fully supported by [Hashicorp memberlist](https://github.com/hashicorp/memberlist). I plan to integrate these features in a future release.
 
@@ -82,7 +82,7 @@ sequenceDiagram
 
 
 ### Quick Demo
-To see Gossipod in action, check out the `./examples` directory, which
+To see Gossipod in action, check out the [`./examples`](https://github.com/TheDhejavu/gossipod/tree/feat/configurable-support/examples) directory, which
 includes a number of demos. Below you can run two different instances of gossipod specifiying different port address and node name
 
 #### Node_1 as a standalone
