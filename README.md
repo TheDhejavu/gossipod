@@ -134,7 +134,6 @@ let metadata = Metadata {
 let gossipod = Gossipod::with_metadata(config, metadata).await?;
 ```
 
-
 ## Example Usage
 
 Here's a basic example of how to use Gossipod in your application:
@@ -166,8 +165,8 @@ while !gossipod.is_running().await {
 ```
 
 ## Reference
-- SWIM: Scalable Weakly-consistent Infection-style Process Group Membership
-Protocol [https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf]
-- Lifeguard: Local Health Awareness for More
-Accurate Failure Detection [https://arxiv.org/pdf/1707.00788]
-- Hashicorp Membership implementation [https://github.com/hashicorp/memberlist]
+- [SWIM: Scalable Weakly-consistent Infection-style Process Group Membership
+Protocol ](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
+- [Lifeguard: Local Health Awareness for More
+Accurate Failure Detection](https://arxiv.org/pdf/1707.00788)
+- [Hashicorp Membership implementation](https://github.com/hashicorp/memberlist)

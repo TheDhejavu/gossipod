@@ -26,11 +26,11 @@ pub(crate) enum EventState {
     Pending,
 
     /// Indicates that the event has reached its scheduled time and has been picked up by the system.
-    /// This state suggests that the associated action or check should now be performed.
+    /// This basically means that we are unable to check that something is true for a given case within a timeframe.
     ReachedDeadline,
 
-    /// Represents an event that was handled before its scheduled time due to external factors.
-    /// This could occur when a condition is met earlier than expected.
+    /// Represents an event that was handled before its deadline time.
+    /// This could occur when a condition is met earlier before it reaches its deadline.
     Intercepted,
 
     /// Indicates that the event was explicitly cancelled before it could time out or be intercepted.
