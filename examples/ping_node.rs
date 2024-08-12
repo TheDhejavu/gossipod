@@ -88,7 +88,6 @@ impl SwimNode {
         .await
         .context("Failed to initialize Gossipod with custom metadata")?;
 
-       
         Ok(SwimNode {
             gossipod: gossipod.into(),
             receiver,

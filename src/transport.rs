@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use std::{net::IpAddr, sync::Arc, time::Duration};
 use tokio::net::UdpSocket;
 use std::net::SocketAddr;
+use std::error::Error;
 use log::*;
 use std::{
     io,
@@ -25,9 +26,9 @@ pub struct Datagram {
 #[async_trait]
 pub trait DatagramTransport: Send + Sync {
     fn incoming(&self) -> broadcast::Receiver<Datagram>;
-    async fn send_to(&self, target: SocketAddr, data: &[u8]) -> Result<()>;
-    fn local_addr(&self) -> Result<SocketAddr>;
-    async fn shutdown(&self) -> Result<()>;
+    async fn send_to(&self, target: SocketAddr, data: &[u8]) ->Result<(), Box<dyn Error + Send + Sync>>;
+    fn local_addr(&self) -> Result<SocketAddr, Box<dyn Error + Send + Sync>>;
+    async fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
 
@@ -148,23 +149,25 @@ impl DefaultTransport {
     }
 }
 
+type TransportError = Box<dyn Error + Send + Sync>;
+
 #[async_trait]
 impl DatagramTransport for DefaultTransport {
     fn incoming(&self) -> broadcast::Receiver<Datagram> {
         self.datagram_tx.subscribe()
     }
 
-    async fn send_to(&self, target: SocketAddr, data: &[u8]) -> Result<()> {
+    async fn send_to(&self, target: SocketAddr, data: &[u8]) -> Result<(), TransportError> {
         self.udp_socket.send_to(&data, target).await
             .context("Failed to send UDP datagram")?;
         Ok(())
     }
 
-    fn local_addr(&self) -> Result<SocketAddr> {
+    fn local_addr(&self) -> Result<SocketAddr, TransportError> {
         Ok(self.udp_socket.local_addr()?)
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(&self) -> Result<(),TransportError> {
         self.shutdown_signal.send(())
             .map_err(|_| anyhow::anyhow!("Failed to send shutdown signal"))?;
         Ok(())

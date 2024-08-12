@@ -3,7 +3,7 @@ use crate::{node::Node, NodeMetadata};
 use std::net::SocketAddr;
 use std::error::Error;
 
-/// A trait for dispatching events.
+/// [`DispatchEventHandler`] trait is used for dispatching events.
 ///
 /// This trait defines methods for handling core SWIM events:
 /// node death detection, node departure, node joining, and message handling.

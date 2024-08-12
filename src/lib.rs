@@ -1,4 +1,6 @@
-use std::io::Read as _;
+#![allow(unused_variables)]
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
@@ -20,10 +22,10 @@ use parking_lot::RwLock;
 use tokio::time::{self, Instant};
 use tokio_util::bytes::{BufMut, BytesMut};
 use tokio_util::codec::Encoder;
-use transport::{Datagram, ListenerEvent, TcpConnectionListener};
+use transport::{ListenerEvent, TcpConnectionListener};
 use utils::pretty_debug;
-use std::net::{SocketAddr};
-use tokio::net::{TcpStream};
+use std::net::SocketAddr;
+use tokio::net::TcpStream;
 use std::time::Duration;
 use crate::{
     config::GossipodConfig,
@@ -33,7 +35,8 @@ use crate::{
     backoff::BackOff,
     state::NodeState,
 };
-pub use transport::{DatagramTransport, DefaultTransport};
+pub use transport::{DatagramTransport, Datagram, DefaultTransport};
+pub use ip_addr::IpAddress;
 pub use node::Node;
 
 mod transport;
@@ -60,9 +63,6 @@ mod dispatch_event_handler;
 /// * Gossipod: Core protocol logic handler that manages messaging requests from 
 /// cluster nodes and executes protocol-specific actions.
 ///
-/// * Listeners: Network event processors that handle incoming TCP and UDP connections
-/// and process messages according to the Gossipod protocol.
-///
 /// * Membership: Local membership state manager that manages membership 
 /// information changes through a single 'merge' entry point. It compares existing 
 /// data with new data and applies necessary updates.
@@ -72,9 +72,6 @@ mod dispatch_event_handler;
 /// concurrency, continuously listens to streams and socket packets, and forwards data 
 /// to listeners for protocol-specific actions. A future improvement plan is to 
 /// implement `io_uring`` for enhanced performance.
-///
-/// * NetService (NetSvc): Intermediary between Gossipod and Transport that constructs 
-/// messages and forwards them to the transport layer.
 ///
 /// Protocol Implementation Details:
 /// `PING`` and `PING-REQ` wil be used for failure detections and information
@@ -97,6 +94,7 @@ mod dispatch_event_handler;
 /// Each node in the network maintains an incarnation number, starting at zero, which can only be incremented by the node itself. 
 /// This number is crucial for managing the node's state in other nodes' local membership lists and serves as a means to refute suspicions 
 /// `(SWIM+Inf.+Susp.)` from other nodes.
+
 
 pub struct Gossipod<M = DefaultMetadata>
 where
@@ -154,6 +152,8 @@ where
     // when it's not set, it defaults to DefaultBroadcastQueue
     pub(crate) broadcasts: Arc<dyn BroadcastQueue>,
 
+    // Dispatch event handler is used for dispatching events based on memebership
+    // state changes
     pub(crate) dispatch_event_handler: Option<Arc<dyn DispatchEventHandler<M>>>
 }
 
@@ -172,7 +172,7 @@ impl Gossipod {
     /// Creates a new instance of [`Gossipod`] with the default metadata.
     pub async fn new(config: GossipodConfig) -> Result<Self> {
         let queue = DefaultBroadcastQueue::new(config.initial_cluster_size);
-        let transport = DefaultTransport::new(config.addr(), config.port()).await?;
+        let transport = DefaultTransport::new(config.ip_addr(), config.port()).await?;
         Gossipod::with_custom(
             config, 
             DefaultMetadata::default(), 
@@ -188,7 +188,7 @@ impl Gossipod {
         dispatch_event_handler: Arc<dyn DispatchEventHandler<DefaultMetadata>>,
     ) -> Result<Self> {
         let queue = DefaultBroadcastQueue::new(config.initial_cluster_size);
-        let transport = DefaultTransport::new(config.addr(), config.port()).await?;
+        let transport = DefaultTransport::new(config.ip_addr(), config.port()).await?;
         Gossipod::with_custom(
             config, 
             DefaultMetadata::default(), 
@@ -213,7 +213,7 @@ where
      ) -> Result<Self> {
     
         let (shutdown_tx, _) = broadcast::channel(1);
-        let addr = transport.local_addr()?;
+        let addr = transport.local_addr().map_err(|e|anyhow!(e))?;
 
         let swim = Self {
             inner: Arc::new(InnerGossipod {
@@ -262,7 +262,7 @@ where
         }
 
         self.set_state(GossipodState::Stopped).await?;
-        self.inner.transport.shutdown().await?;
+        self.inner.transport.shutdown().await.map_err(|e|anyhow!(e))?;
         self.leave().await?;
 
         info!("> [GOSSIPOD] Gracefully shut down due to {:?}", shutdown_reason);
@@ -335,7 +335,12 @@ where
                             time::sleep(backoff.reset_timeout).await;
                             return;
                         }
-
+                        // NOTE: The probing mechanism relies on timeouts to detect node failures, which may not always be reliable.
+                        // Datagrams (UDP) are inherently unreliable, making it difficult to ascertain if a response was lost in transit or if
+                        // the node is genuinely down. To mitigate this, we're using an adaptive timeout deadline based on network type, 
+                        // assuming that WANs typically have longer delays than LANs. However, this approach may still lead to false 
+                        // positives, particularly in cases where a node is momentarily unresponsive due to factors like garbage collection (GC)
+                        // or heavy load.
                         match gossipod.probe().await {
                             Ok(_) => {
                                 debug!(
@@ -367,9 +372,6 @@ where
                         };
 
                         let final_delay = std::cmp::max(backoff_delay, size_based_delay);
-                        if final_delay != backoff_delay {
-                            info!("Adjusting probe interval to {:?} based on cluster size", final_delay);
-                        }
                         debug!("Waiting for {:?} before next probe", final_delay);
                         time::sleep(final_delay).await;
                     } => {}
@@ -488,9 +490,6 @@ where
                         };
 
                         let final_delay = std::cmp::max(backoff_delay, size_based_delay);
-                        if final_delay != backoff_delay {
-                            info!("Adjusting gossip interval to {:?} based on cluster size", final_delay);
-                        }
                         debug!("Waiting for {:?} before next gossip", final_delay);
                         time::sleep(final_delay).await;
                     } => {}
@@ -591,7 +590,7 @@ where
             let message = self.encode_message_with_piggybacked_updates(ping).await?;
             let target = node.socket_addr()?;
 
-            self.send_probe_and_respond(message.to_vec(), target, sequence_number, node).await?;
+            self.send_probe_and_respond(message, target, sequence_number, node).await?;
         } else {
             debug!("No target node to select for probing");
         }
@@ -603,7 +602,8 @@ where
     /// The function sends a UDP message to the target node, schedules an event to wait for an acknowledgment,
     /// and handles the response within the specified deadlines. If no acknowledgment is received before the probe
     /// deadline, the node is marked as suspect.
-    async fn send_probe_and_respond(&self, message_bytes: Vec<u8>, target: SocketAddr, sequence_number: u64, node: Node<M>) -> Result<()> {
+    /// 
+    async fn send_probe_and_respond(&self, message_bytes: BytesMut, target: SocketAddr, sequence_number: u64, node: Node<M>) -> Result<()> {
         let now = Instant::now();
         let cluster_size = self.inner.members.len().unwrap_or(self.inner.config.initial_cluster_size);
         let probe_deadline = now+self.inner.config.calculate_interval(
@@ -613,7 +613,7 @@ where
 
         let ack_deadline = now + self.inner.config.ack_timeout;
 
-        self.inner.transport.send_to(target, &message_bytes).await?;
+        self.inner.transport.send_to(target, &message_bytes).await.map_err(|e|anyhow!(e))?;
 
         let (mut rx, _) = self.inner.event_scheduler.schedule_event(
             EventType::Ack { sequence_number }, 
@@ -639,16 +639,16 @@ where
     async fn handle_ack_response(&self, event_state: Option<EventState>, sequence_number: u64, node: Node<M>, probe_deadline: Instant) -> Result<()> {
         match event_state {
             Some(EventState::Intercepted) => {
-                debug!("> Received ACK for probe to node {}", node.name);
+                debug!("Received ACK for probe to node {}", node.name);
             },
             Some(EventState::ReachedDeadline) => {
                 self.handle_ack_timeout(sequence_number, node, probe_deadline).await?;
             },
             Some(other_state) => {
-                warn!("> Unexpected event state: {:?}", other_state);
+                warn!("Unexpected event state: {:?}", other_state);
             },
             None => {
-                warn!("> Event channel closed unexpectedly for node {}", node.name);
+                warn!("Event channel closed unexpectedly for node {}", node.name);
             }
         }
         Ok(())
@@ -660,7 +660,7 @@ where
         node: Node<M>,
         probe_deadline: Instant,
     ) -> Result<()> {
-        warn!("> Probe to node {} timed out without ACK, proceeding to PING-REQ", node.name);
+        warn!("Probe to node {} timed out without ACK, proceeding to PING-REQ", node.name);
         let local_addr = self.get_local_node().await?.socket_addr()?;
         self.send_indirect_pings(local_addr, sequence_number, node.socket_addr()?).await?;
 
@@ -691,16 +691,16 @@ where
     ) -> Result<()> {
         match event_state {
             Some(EventState::Intercepted) => {
-                debug!("> Received ACK for probe to node {}", node.name);
+                debug!("[ERR] Received ACK for probe to node {}", node.name);
             },
             Some(EventState::ReachedDeadline) => {
                 self.handle_suspect_node(node).await?;
             },
             Some(other_state) => {
-                warn!("> Unexpected event state: {:?}", other_state);
+                warn!("Unexpected event state: {:?}", other_state);
             },
             None => {
-                warn!("> Event channel closed unexpectedly for node {}", node.name);
+                warn!("ERR] Event channel closed unexpectedly for node {}", node.name);
             }
         }
         Ok(())
@@ -721,7 +721,7 @@ where
         Ok(())
     }
     async fn send_indirect_pings(&self, local_addr: SocketAddr,sequence_number: u64, target: SocketAddr) -> Result<()> {
-        debug!(">> send indirect pings");
+        debug!("[PING] Send indirect pings");
         let known_nodes = self.inner.members.select_random_probe_nodes(INDIRECT_REQ, Some(|n: &Node<M>| {
             !n.is_alive() || n.socket_addr().map_or(true, |addr| addr == local_addr || addr == target)
         })).unwrap_or_default();
@@ -748,9 +748,9 @@ where
             let message_bytes = self.encode_message_with_piggybacked_updates(ping_req.clone()).await?;
     
             if let Err(e) = self.inner.transport.send_to(node.socket_addr()?, &message_bytes).await {
-                warn!("Failed to send indirect ping to {} for target {}: {}", node.name, target, e);
+                warn!("[ERR] Failed to send indirect ping to {} for target {}: {}", node.name, target, e);
             } else {
-                debug!("Sent indirect ping to {} for target {}", node.name, target);
+                debug!("[INFO] Sent indirect ping to {} for target {}", node.name, target);
             }
         }
     
@@ -861,7 +861,7 @@ where
         debug!("Nodes to gossip: {:?}", known_nodes.len());
         for node in &known_nodes {
             for (key, broadcast) in &messages {
-                match self.inner.transport.send_to(node.socket_addr()?, broadcast).await {
+                match self.inner.transport.send_to(node.socket_addr()?, &broadcast).await {
                     Ok(_) => {
                         debug!("Gossiped message to {}", node.name);
                     },
@@ -912,8 +912,8 @@ where
                 }
             },
             _ => {
-                warn!("Received Non-Ping message in handle_ping from {}", sender);
-                return Err(anyhow!("Unexpected message type in handle_ping"));
+                warn!("Received NON PING message from {}", sender);
+                return Err(anyhow!("Unexpected message type"));
             }
         }
         Ok(())
@@ -966,7 +966,7 @@ where
                     sender: local_addr,
                     payload: MessagePayload::Ping(ping_payload),
                 };
-                debug!("> send ping: {:?}", ping);
+                debug!("Send ping: {:?}", ping);
 
                 // Add prioritized updates to the message
                 let message_bytes = self.encode_message_with_piggybacked_updates(ping).await?;
@@ -1000,29 +1000,29 @@ where
                         match event_state {
                             Some(EventState::Intercepted) => {
                                 debug!(
-                                    ">> Received ACK for Indriect PING to target {}", 
+                                    "Received ACK for Indriect PING to target {}", 
                                     original_target,
                                 );
                                 self.send_ack(sender, original_sequence_number).await?;
                             },
                             Some(EventState::ReachedDeadline) => {
-                                warn!(">> Indirect PING to target {} reached deadline", original_target);
+                                warn!("Indirect PING to target {} reached deadline", original_target);
                             },
                             Some(other_state) => {
-                                warn!(">> Unexpected event state: {:?}", other_state);
+                                warn!("Unexpected event state: {:?}", other_state);
                             },
                             None => {
-                                warn!(">> Event channel closed unexpectedly for target {}", original_target);
+                                warn!("Event channel closed unexpectedly for target {}", original_target);
                             }
                         }
                     },
                     _ = tokio::time::sleep_until(probe_deadline) => {
-                        warn!(">> Indirect PING deadline reached for target {}", original_target);
+                        warn!("Indirect PING deadline reached for target {}", original_target);
                     }
                 }
             },
             _ => {
-                warn!("Received non-Ping-Req message in PING_REQ from {}", sender);
+                warn!("Received NON PING REQ message in PING_REQ from {}", sender);
                 return Err(anyhow!("Unexpected message type in PING_REQ"));
             }
         }
@@ -1221,7 +1221,7 @@ where
     }
 
     async fn set_local_node_liveness(&self) -> Result<()> {
-        let ip_addr = self.inner.config.addr();
+        let ip_addr = self.inner.config.ip_addr();
         let name = self.inner.config.name();
         let port = self.inner.config.port();
         let incarnation = self.next_incarnation();
@@ -1262,7 +1262,7 @@ where
     }
 
     pub(crate) async fn integrate_new_node(&self, member: RemoteNode) -> Result<()> {
-        debug!(">>>> Integrate new node");
+        debug!("Integrate new node");
         let _ = self.inner.event_scheduler.intercept_event(&EventType::SuspectTimeout{node: member.name.clone()}).await;
 
         let metadata = M::from_bytes(&member.metadata)
@@ -1277,7 +1277,7 @@ where
         );
         new_node.update_state(member.state)?;
 
-        debug!(">> Processing join for node: {:?}", new_node);
+        debug!("Processing join for node: {:?}", new_node);
 
         // Attempt to merge the new node into our membership list
         match self.inner.members.merge(&new_node) {
@@ -1313,7 +1313,7 @@ where
                         }
                     },
                     MergeAction::Unchanged => {
-                        debug!(">> No changes for node {} in the cluster", member.name);
+                        debug!("No changes for node {} in the cluster", member.name);
                     },
                     _ => {}
                 }
@@ -1324,13 +1324,13 @@ where
             }
         }
 
-        debug!(">> {}", pretty_debug("Membership:", &self.inner.members.get_all_nodes()?));
+        debug!("{}", pretty_debug("Membership:", &self.inner.members.get_all_nodes()?));
 
         Ok(())
     }
 
     async fn process_node_departure(&self, incarnation: u64, member: &str) -> Result<()> {
-        debug!(">> Leave incarnation: {}", incarnation);
+        debug!("Leave incarnation: {}", incarnation);
 
         if let Ok(Some(node)) = self.inner.members.get_node(member) {
             let mut leave_node = node.clone();
@@ -1513,7 +1513,7 @@ where
         };
 
         self.broadcast(target, local_addr, broadcast.clone()).await
-            .context("failed to send join broadcast to initial contact")?;
+            .context("Failed to send join broadcast to initial contact")?;
 
         self.inner.broadcasts.upsert(broadcast.get_key(), broadcast)?;
         Ok(())
@@ -1531,7 +1531,7 @@ where
         let mut buffer = BytesMut::new();
         codec.encode(message, &mut buffer)?;
 
-        self.inner.transport.send_to(target,&buffer).await
+        self.inner.transport.send_to(target,&buffer).await.map_err(|e|anyhow!(e))
     }
 
     async fn handle_piggybacked_updates(&self, updates: Vec<RemoteNode>) -> Result<()> {
@@ -1700,7 +1700,7 @@ where
         if self.inner.config.disable_tcp {
             return Ok(());
         }
-        let addr = self.inner.transport.local_addr()?;
+        let addr = self.inner.transport.local_addr().map_err(|e|anyhow!(e))?;
         let tcp_listener = TcpConnectionListener::bind(addr).await?;
         let mut shutdown_rx = self.inner.shutdown.subscribe();
         let gossipod = self.clone();
@@ -1721,7 +1721,7 @@ where
                             }
                             ListenerEvent::Error(err) => {
                                 error!("TCP listener error: {}", err);
-                                // TODO: Implement backoff strategy here if needed
+                                // TODO: Implement backoff + circuit breaker here if errors persist
                             }
                         }
                     }
@@ -1758,7 +1758,7 @@ where
     }
 
     /// Processes a stream over TCP
-    async fn process_tcp_stream(gossipod: &Gossipod<M>, data: &[u8], stream: &mut TcpStream, remote_addr: SocketAddr) -> Result<()> {
+    async fn process_tcp_stream(gossipod: &Gossipod<M>, data: &[u8], _stream: &mut TcpStream, remote_addr: SocketAddr) -> Result<()> {
         let message = Message::from_vec(data)
                     .context("Failed to decode message")?;
 

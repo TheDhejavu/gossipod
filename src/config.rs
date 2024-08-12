@@ -22,7 +22,7 @@ pub(crate) const MAX_UDP_PACKET_SIZE: usize = 1400;
 pub(crate) const BROADCAST_FANOUT: usize = 2; 
 pub(crate) const INDIRECT_REQ: usize = 2;
 
-/// Represents the type of network environment the gossip protocol is operating in.
+/// [`NetworkType`] Represents the type of network environment the gossip protocol is operating in.
 /// This affects various timing and timeout calculations.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NetworkType {
@@ -43,7 +43,7 @@ impl Default for NetworkType {
     }
 }
 
-/// Main configuration structure for the Gossipod protocol
+/// [`GossipodConfig`] configuration structure for the Gossipod protocol
 pub struct GossipodConfig {
     /// Name of the node, used for identification in the cluster
     pub(crate) name: String,
@@ -85,6 +85,8 @@ pub struct GossipodConfig {
     /// allowing them an opportunity to refute their dead status if they're actually alive.
     pub(crate) dead_node_gossip_window: Duration,
 
+    // Disable tcp listener. When TCP is disabled, connection-oriented messages like AppMsg
+    // automatically never gets processed. 
     pub(crate) disable_tcp: bool,
 }
 
@@ -108,7 +110,7 @@ impl Clone for GossipodConfig {
 }
 
 impl GossipodConfig {
-    pub fn addr(&self) -> IpAddr {
+    pub fn ip_addr(&self) -> IpAddr {
         self.ip_addr
     }
 

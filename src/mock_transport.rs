@@ -1,8 +1,9 @@
 use std::{collections::VecDeque, net::IpAddr};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::error::Error;
 use tokio::sync::{broadcast, Mutex};
-use anyhow::Result;
+// use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::state::NodeState;
@@ -44,16 +45,16 @@ impl DatagramTransport for MockDatagramTransport {
         self.datagram_tx.subscribe()
     }
 
-    async fn send_to(&self, target: SocketAddr, data: &[u8]) -> Result<()> {
+    async fn send_to(&self, target: SocketAddr,data: &[u8]) ->  Result<(), Box<dyn Error + Send + Sync>> {
         self.outgoing_queue.lock().await.push_back((target, data.to_vec()));
         Ok(())
     }
 
-    fn local_addr(&self) -> Result<SocketAddr> {
+    fn local_addr(&self) -> Result<SocketAddr, Box<dyn Error + Send + Sync>>{
         Ok(self.local_addr)
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
 }

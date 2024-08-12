@@ -22,7 +22,7 @@ Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Me
 - [x] Extensible design allowing for future custom behaviors 
 - [x] Configurable failure detection parameters
 - [x] Inbuilt Support for both TCP & UDP 
-- [x] Configurable Transport layer (QUINN, UDP)
+- [x] Pluggable Transport layer (QUIC, UDP)
 - [ ] Basic encryption of data packets for secure communication
 - [ ] Support `io_uring` runtime via Tokio
 - [ ] Configurable Observability (Logging and Metrics)

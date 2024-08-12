@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
 
     // Use Default broadcast Queue
     let broadcast_queue =  Arc::new(DefaultBroadcastQueue::new(1));
-    let transport = Arc::new(DefaultTransport::new(config.addr(), config.port()).await?);
+    let transport = Arc::new(DefaultTransport::new(config.ip_addr(), config.port()).await?);
     let gossipod = Gossipod::with_custom(config, metadata, broadcast_queue, transport, None)
         .await
         .context("Failed to initialize Gossipod with custom metadata")?;
