@@ -240,7 +240,7 @@ impl<M: NodeMetadata> Node<M> {
         }
     }
 
-    /// Creates a new node with state
+    /// Creates a new  [`Node`] with state
     pub fn with_state(state: NodeState, ip_addr: IpAddr, port: u16, name: String, incarnation: u64, metadata: M ) -> Self {
         Self {
             ip_addr,

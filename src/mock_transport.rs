@@ -3,7 +3,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::error::Error;
 use tokio::sync::{broadcast, Mutex};
-// use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::state::NodeState;
