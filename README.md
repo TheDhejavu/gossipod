@@ -11,7 +11,9 @@ Asynchronous SWIM(Scalable Weakly-consistent Infection-style Process Group Me
 > The codebase may contain bugs or incomplete features.
 > Use with caution. Feedback and contributions welcome, Thanks!.
 
-[RESEARCH PAPER](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
+
+- [Swim Research Paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
+- Examples: [Consistent Hashing](https://github.com/TheDhejavu/gossipod-examples/tree/main/hashring) | [QUIC](https://github.com/TheDhejavu/gossipod-examples/tree/main/quic) 
 
 ## Proposed Key Features
 
@@ -92,8 +94,6 @@ includes a number of demos. Below you can run two different instances of gossipo
 ```sh
 > cargo run --example pong_node -- --name=NODE_2 --port=7947 --join-addr=127.0.0.1:7948
 ```
-
-#### [Demos](https://github.com/TheDhejavu/gossipod-examples)
 
 # Gossipod API
 
