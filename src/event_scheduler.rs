@@ -1,10 +1,19 @@
 use std::collections::{BinaryHeap, HashMap};
+use std::future::Future as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
+use pin_project::pin_project;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 use anyhow::{Result, anyhow};
-use tokio::time::Instant;
-use std::cmp::Ordering;
+use tokio::time::{Instant, Sleep};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::cmp::Ordering as CmpOrdering;
+use futures::stream::Stream;
+use crossbeam::queue::SegQueue;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum EventType {
@@ -23,243 +32,259 @@ pub(crate) enum EventType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EventState {
     /// The initial state of a newly scheduled event.
-    Pending,
+    Pending = 0,
 
     /// Indicates that the event has reached its scheduled time and has been picked up by the system.
     /// This basically means that we are unable to check that something is true for a given case within a timeframe.
-    ReachedDeadline,
+    ReachedDeadline = 1,
 
     /// Represents an event that was handled before its deadline time.
     /// This could occur when a condition is met earlier before it reaches its deadline.
-    Intercepted,
+    Intercepted = 2,
 
     /// Indicates that the event was explicitly cancelled before it could time out or be intercepted.
     /// This might happen if the event becomes irrelevant or unnecessary before its scheduled time.
-    Cancelled,
+    Cancelled = 3,
 }
 
+// ========= Refactor
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct EventId(u64);
+#[derive(Debug)]
+pub(crate) struct Event {
+    id: u64,
+    pub(crate) event_type: EventType,
+    pub(crate) state: AtomicU8,
+    pub(crate) sender: mpsc::Sender<EventState>,
+}
 
-impl Ord for EventId {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
+impl Event {
+    // Create new event.
+    fn new(event_type: EventType, sender: mpsc::Sender<EventState>, id: u64) -> Self {
+        Event {
+            sender,
+            event_type,
+            state: AtomicU8::new(EventState::Pending as u8),
+            id,
+        }
     }
-}
 
-impl PartialOrd for EventId {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    // Get event state.
+    pub(crate) fn get_state(&self) -> EventState {
+        match self.state.load(Ordering::Relaxed) {
+            0 => EventState::Pending,
+            1 => EventState::ReachedDeadline,
+            2 => EventState::Intercepted,
+            3 => EventState::Cancelled,
+            _ => unreachable!(),
+        }
+    }
+
+    // Set event state.
+    fn set_state(&self, new_state: EventState) -> bool {
+        self.state.compare_exchange(
+            EventState::Pending as u8,
+            new_state as u8,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ).is_ok()
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct Event {
-    pub(crate) state: EventState,
-    pub(crate) sender: mpsc::Sender<EventState>,
+struct TimestampedEvent {
+    deadline: Instant,
+    event: Arc<Event>,
+}
+
+impl PartialEq for TimestampedEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.event.id == other.event.id
+    }
+}
+
+impl Eq for TimestampedEvent {}
+
+impl PartialOrd for TimestampedEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimestampedEvent {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other.deadline.cmp(&self.deadline).then_with(|| other.event.id.cmp(&self.event.id))
+    }
 }
 
 pub(crate) struct EventScheduler {
-    events: Arc<RwLock<BinaryHeap<(Instant, EventId)>>>,
-    event_map: Arc<RwLock<HashMap<EventType, (EventId, Event)>>>,
-    event_counter: std::sync::atomic::AtomicU64,
+    event_map: Arc<RwLock<HashMap<EventType, Arc<Event>>>>,
+    incoming_events: Arc<SegQueue<TimestampedEvent>>,
+    next_event_id: AtomicU64,
 }
 
 impl EventScheduler {
-    // Create new [`EventScheduler`] Instance
     pub(crate) fn new() -> Self {
         EventScheduler {
-            events: Arc::new(RwLock::new(BinaryHeap::new())),
+            incoming_events: Arc::new(SegQueue::new()),
             event_map: Arc::new(RwLock::new(HashMap::new())),
-            event_counter: std::sync::atomic::AtomicU64::new(0),
+            next_event_id: AtomicU64::new(0),
         }
     }
-
     /// Schedules a new event with a specified type and deadline.
-    /// Returns a receiver to monitor the event state.
+    /// Returns a sender and a receiver to monitor the event state.
     pub(crate) async fn schedule_event(
         &self,
         event_type: EventType,
         deadline: Instant,
-    ) -> Result<(mpsc::Receiver<EventState>, mpsc::Sender<EventState>)> {
-        let mut event_map = self.event_map.write().await;
-        if event_map.contains_key(&event_type) {
+    )-> Result<(mpsc::Receiver<EventState>, mpsc::Sender<EventState>)> {
+        if self.event_map.read().await.contains_key(&event_type) {
             return Err(anyhow!("An event of this type already exists"));
         }
+        
+        // Create a sender and receiver channel.
+        let (sender, receiver) = mpsc::channel(1);
+        let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
 
-        let (sender, receiver) = mpsc::channel(10);
-        let id = EventId(self.event_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        // Construct new event.
+        let event =  Arc::new(Event::new(event_type.clone(), sender.clone(), id));
 
-        let event = Event {
-            state: EventState::Pending,
-            sender: sender.clone(),
-        };
+        // Push events to lock-free incoming_events(`SegQueue`).
+        self.incoming_events.push(TimestampedEvent { deadline, event: event.clone() });
 
-        event_map.insert(event_type, (id.clone(), event));
-        self.events.write().await.push((deadline, id));
+        // Keep track of event in a map for interception / cancelling purposes
+        self.event_map.write().await.insert(event_type, event.clone());
 
         Ok((receiver, sender))
     }
 
-    /// Retrieves the next event that has reached its deadline.
-    /// Returns the event type and event details if any.
-    pub(crate) async fn next_event(&self) -> Option<(EventType, Event)> {
-        let now = Instant::now();
-        let mut events = self.events.write().await;
+    /// Intercepts a specified event, changing its state to Intercepted.
+    pub(crate) async fn intercept_event(&self, event_type: &EventType) -> bool {
+        if let Some(event) = self.event_map.read().await.get(event_type) {
+            event.set_state(EventState::Intercepted)
+        } else {
+            false
+        }
+    }
+    /// Cancels a specified event before it reaches deadline, this can be use for a different case
+    /// where `intercept_event` is not ideal.
+    pub(crate) async fn cancel_event(&self, event_type: &EventType) -> bool {
+        if let Some(event) = self.event_map.read().await.get(event_type) {
+            event.set_state(EventState::Cancelled)
+        } else {
+            false
+        }
+    }
+
+    // Remove event from event mapping.
+    async fn remove_event(&self, event_type: &EventType) -> Option<Arc<Event>> {
         let mut event_map = self.event_map.write().await;
-        
-        while let Some((time, id)) = events.pop() {
-            if time <= now {
-                // Find and remove the event from the event_map
-                let event_entry = event_map.iter()
-                    .find(|(_, (event_id, _))| event_id == &id)
-                    .map(|(event_type, _)| event_type.clone());
-    
-                if let Some(event_type) = event_entry {
-                    if let Some((_, event)) = event_map.remove(&event_type) {
-                        return Some((event_type,  Event { 
-                            state: EventState::ReachedDeadline, 
-                            sender: event.sender
-                        }));
-                    }
-                }
-            } else {
-                // If the event is in the future, put it back and stop searching
-                events.push((time, id));
+        event_map.remove(event_type)
+    }
+}
+
+#[pin_project]
+pub(crate) struct EventStream {
+    scheduler: Arc<EventScheduler>,
+    lobby: BinaryHeap<TimestampedEvent>,
+    #[pin]
+    sleep: Pin<Box<Sleep>>,
+}
+
+impl EventStream {
+    // Create new event stream.
+    pub(crate) fn new(scheduler: Arc<EventScheduler>) -> Self {
+        EventStream {
+            scheduler,
+            lobby: BinaryHeap::new(),
+            sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
+        }
+    }
+    // Move event stream from events(`SegQueue`) from incoming to lobby for processing
+    fn move_incoming_events_to_lobby(&mut self) -> bool {
+        let mut moved_events = false;
+        let now = Instant::now();
+        while let Some(event) = self.scheduler.incoming_events.pop() {
+            // events by default are FIFO, here we move any event that we see to the lobby for processing
+            let current_deadline = event.deadline;
+            self.lobby.push(event);
+            moved_events = true;
+
+            // if the current event that we picked has not reached deadline yet, we stop 
+            // we only want to priotize moving event that have reached deadline to the lobby.
+            if now < current_deadline {
                 break;
             }
         }
-        None
+        moved_events
     }
-
-    /// Calculates the duration until the next event is due.
-    /// 
-    /// Returns the duration if an event is found, or None if there are no events.
-    pub(crate) async fn time_to_next_event(&self) -> Option<Duration> {
-        let now = Instant::now();
-        let events = self.events.read().await;
-        
-        events.peek().map(|(time, _)| {
-            if *time > now {
-                *time - now
+    // Peek into the lobby and calculate time for the next deadline.
+    fn time_until_next_event(&self) -> Option<Duration> {
+        self.lobby.peek().map(|event| {
+            let now = Instant::now();
+            if event.deadline > now {
+                event.deadline - now
             } else {
+                // do it now.
                 Duration::from_secs(0)
             }
         })
     }
+}
 
-    /// Retrieves a limited number of events that are due up to the current time.
-    /// 
-    /// Returns a vector of event types and event details that reached it's deadline
-    pub(crate) async fn next_events(&self, limit: usize) -> Vec<(EventType, Event)> {
-        let now = Instant::now();
-        let mut due_events = Vec::with_capacity(limit);
-        let mut processed = 0;
+impl Stream for EventStream {
+    type Item = Arc<Event>;
 
-        loop {
-            // Acquire read lock to check if there's work to do
-            let events = self.events.read().await;
-            if events.is_empty() || events.peek().map_or(true, |(time, _)| *time > now) || processed >= limit {
-                break;
-            }
-            drop(events);
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let moved_events = self.move_incoming_events_to_lobby();
 
-            // Process one event at a time
-            if let Some((event_type, event)) = self.process_next_event().await {
-                due_events.push((event_type, event));
-                processed += 1;
-            } else {
-                break;
-            }
-        }
-
-        due_events
-    }
-
-    async fn process_next_event(&self) -> Option<(EventType, Event)> {
-        let now = Instant::now();
-        
-        // Acquire write locks for a short duration
-        let mut events = self.events.write().await;
-        if let Some((time, id)) = events.pop() {
-            if time <= now {
-                drop(events);
-                let mut event_map = self.event_map.write().await;
-                let event_entry = event_map.iter()
-                    .find(|(_, (event_id, _))| event_id == &id)
-                    .map(|(event_type, _)| event_type.clone());
-
-                if let Some(event_type) = event_entry {
-                    if let Some((_, event)) = event_map.remove(&event_type) {
-                        return Some((event_type,  Event { 
-                            state: EventState::ReachedDeadline, 
-                            sender: event.sender
-                        }));
-                    }
+        // Process events from the lobby(`BinaryHeap`).
+        while let Some(TimestampedEvent { deadline, event }) = self.lobby.pop() {
+            // Double-check the deadline in case time has passed since moving events
+            let now = Instant::now();
+            if deadline <= now {
+                // The event has reached its deadline
+                if event.set_state(EventState::ReachedDeadline) {
+                    return Poll::Ready(Some(event));
                 }
+                
+                // If set state failed then we are sure that event has probably been intercepted / cancelled.
+                return Poll::Ready(Some(event));
             } else {
-                // If the event is in the future, put it back
-                events.push((time, id));
+                // If the event is still in the future, put it back into the lobby and stop processing
+                self.lobby.push(TimestampedEvent { deadline, event });
+                break;
             }
         }
-        None
-    }
-    
-    /// Intercepts a specified event, changing its state to Intercepted.
-    /// 
-    /// Removes the event from both the event map and the event heap.
-    pub(crate) async fn intercept_event(&self, event_type: &EventType) -> Result<()> {
-        let mut event_map = self.event_map.write().await;
-        
-        if let Some((id, event)) = event_map.remove(event_type) {
-            event.sender.send(EventState::Intercepted).await?;
-            // Remove the event from the events heap as well
-            let mut events = self.events.write().await;
-            events.retain(|&(_, ref e_id)| e_id != &id);
-            Ok(())
-        } else {
-            Err(anyhow!("Event not found"))
-        }
-    }
 
-    /// Cancels a specified event before it reaches deadline, this can be use for a different case
-    /// where intercept_event is not ideal.
-    pub(crate) async fn cancel_event(&self, event_type: &EventType) -> Result<()> {
-        let mut event_map = self.event_map.write().await;
-        
-        if let Some((id, event)) = event_map.remove(event_type) {
-            event.sender.send(EventState::Cancelled).await?;
-            // Remove the event from the events heap as well
-            let mut events = self.events.write().await;
-            events.retain(|&(_, ref e_id)| e_id != &id);
-            Ok(())
-        } else {
-            Err(anyhow!("Event not found"))
+        if let Some(next_deadline) = self.time_until_next_event() {
+            let deadline = Instant::now() + next_deadline;
+            // TODO: we shouldn't be setting a new pin.
+            let new_sleep = Box::pin(tokio::time::sleep_until(deadline));
+            self.as_mut().project().sleep.as_mut().set(new_sleep);
+        }
+
+        // If we moved events but couldn't process any, we need to try again soon
+        if moved_events {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        // Check if the sleep future is ready
+        match self.project().sleep.poll(cx) {
+            Poll::Ready(_) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::time::{sleep, timeout};
-
-    #[tokio::test]
-    async fn test_schedule_and_next_event() {
-        let manager = EventScheduler::new();
-        let now = Instant::now();
-        let event_type = EventType::SuspectTimeout { node: "node".to_string() };
-        
-        manager.schedule_event(event_type.clone(), now + Duration::from_millis(100)).await.unwrap();
-        
-        sleep(Duration::from_millis(110)).await;
-        
-        let event = manager.next_event().await;
-        assert!(event.is_some());
-        let (returned_type, _) = event.unwrap();
-        assert_eq!(returned_type, event_type);
-    }
 
     #[tokio::test]
     async fn test_intercept_event() {
@@ -269,7 +294,7 @@ mod tests {
         
         let (mut receiver, _) = manager.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await.unwrap();
         
-        manager.intercept_event(&event_type).await.unwrap();
+        assert!(manager.intercept_event(&event_type).await);
         
         let result = timeout(Duration::from_millis(100), receiver.recv()).await;
         assert!(result.is_ok());

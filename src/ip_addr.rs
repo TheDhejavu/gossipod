@@ -34,22 +34,35 @@ impl FromStr for IpAddress {
 }
 
 impl IpAddress {
-    /// Finds the system's non-loopback IPv4 address.
+   /// Finds the system's non-loopback IPv4 & IPv6 addresses.
     ///
-    /// Returns the first non-loopback IPv4 address found, or an error if none is available.
-    pub fn find_system_ip() -> Result<IpAddr> {
+    /// Returns a struct containing the first non-loopback IPv4 and IPv6 addresses found,
+    /// or an error if neither is available.
+    pub fn find_system_ip() -> Result<(IpAddr, IpAddr)> {
         let networks = Networks::new_with_refreshed_list();
+        let mut ipv4: Option<IpAddr> = None;
+        let mut ipv6: Option<IpAddr> = None;
+
         for (_, data) in &networks {
             for ip in data.ip_networks() {
-                if let IpAddr::V4(ipv4) = ip.addr {
-                    if !ipv4.is_loopback() {
-                        return Ok(IpAddr::V4(ipv4));
+                if let IpAddr::V4(ipv4_addr) = ip.addr {
+                    if !ipv4_addr.is_loopback() {
+                        ipv4 = Some(IpAddr::V4(ipv4_addr));
+                    }
+                }
+
+                if let IpAddr::V6(ipv6_addr) = ip.addr {
+                    if !ipv6_addr.is_loopback() {
+                        ipv6 = Some(IpAddr::V6(ipv6_addr));
                     }
                 }
             }
         }
+        if ipv4.is_none() && ipv6.is_none() {
+            return Err(anyhow!("No suitable IPv4 or IPV6 address found"))
+        }
 
-        Err(anyhow!("No suitable IPv4 address found"))
+        return Ok((ipv4.unwrap(), ipv6.unwrap()));
     }
 }
 impl AsRef<IpAddr> for IpAddress {
