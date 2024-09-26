@@ -27,7 +27,6 @@ use transport::{ListenerEvent, TcpConnectionListener};
 use utils::pretty_debug;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
-use std::time::Duration;
 use crate::{
     config::GossipodConfig,
     event_scheduler::EventScheduler,
@@ -149,8 +148,6 @@ where
     /// Manager for handling and creating timestamped events
     event_scheduler: Arc<EventScheduler>,
 
-    event_stream: Arc<EventStream>,
-
     // broadcasts represents outbound messages to peers
     // when it's not set, it defaults to DefaultBroadcastQueue
     pub(crate) broadcasts: Arc<dyn BroadcastQueue>,
@@ -219,7 +216,6 @@ where
         let addr = transport.local_addr().map_err(|e|anyhow!(e))?;
 
         let event_scheduler = Arc::new(EventScheduler::new());
-        let event_stream = Arc::new(EventStream::new(event_scheduler.clone()));
         let swim = Self {
             inner: Arc::new(InnerGossipod {
                 config,
@@ -231,7 +227,6 @@ where
                 sequence_number: AtomicU64::new(0),
                 incarnation: AtomicU64::new(0),
                 event_scheduler: event_scheduler,
-                event_stream: event_stream,
                 broadcasts,
                 dispatch_event_handler,
             })
@@ -391,12 +386,13 @@ where
 
     pub(crate) fn launch_event_scheduler(&self, mut shutdown_rx: broadcast::Receiver<()>) -> tokio::task::JoinHandle<Result<()>> {
         let gossipod = self.clone();
-        
+        let scheduler_event_stream = EventStream::new(self.inner.event_scheduler.clone());
         tokio::spawn(async move {
+            let mut event_stream = pin!(scheduler_event_stream);
             loop {
-                let mut event_stream = pin!(gossipod.inner.event_stream);
                 tokio::select! {
-                    event = poll_fn(|cx| event_stream.as_mut().poll_next(cx)) =>{
+                    event = poll_fn(|cx| event_stream.as_mut().poll_next(cx)) => {
+                        debug!("====== Poll: Event Stream =========");
                         if let Some(current_event) = event {
                             match current_event.get_state() {
                                 EventState::ReachedDeadline => {
@@ -424,6 +420,8 @@ where
                                     // Event was intercepted or cancelled, no action needed
                                 }
                             }
+                            // Ensure to remove event.
+                            gossipod.inner.event_scheduler.remove_event(&current_event).await;
                         }
                     }
                     _ = shutdown_rx.recv() => {

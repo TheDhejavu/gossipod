@@ -1,15 +1,14 @@
 use std::collections::{BinaryHeap, HashMap};
-use std::future::Future as _;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{mpsc, Notify, RwLock};
 use pin_project::pin_project;
+use tracing::debug;
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
 use anyhow::{Result, anyhow};
-use tokio::time::{Instant, Sleep};
+use tokio::time::{sleep_until, Instant};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::cmp::Ordering as CmpOrdering;
 use futures::stream::Stream;
@@ -120,6 +119,7 @@ pub(crate) struct EventScheduler {
     event_map: Arc<RwLock<HashMap<EventType, Arc<Event>>>>,
     incoming_events: Arc<SegQueue<TimestampedEvent>>,
     next_event_id: AtomicU64,
+    new_event_notify: Arc<Notify>,
 }
 
 impl EventScheduler {
@@ -128,6 +128,7 @@ impl EventScheduler {
             incoming_events: Arc::new(SegQueue::new()),
             event_map: Arc::new(RwLock::new(HashMap::new())),
             next_event_id: AtomicU64::new(0),
+            new_event_notify: Arc::new(Notify::new()),
         }
     }
     /// Schedules a new event with a specified type and deadline.
@@ -154,31 +155,36 @@ impl EventScheduler {
         // Keep track of event in a map for interception / cancelling purposes
         self.event_map.write().await.insert(event_type, event.clone());
 
+        // Notify event stream of new event.
+        self.new_event_notify.notify_one();
+
         Ok((receiver, sender))
     }
 
     /// Intercepts a specified event, changing its state to Intercepted.
-    pub(crate) async fn intercept_event(&self, event_type: &EventType) -> bool {
+    pub(crate) async fn intercept_event(&self, event_type: &EventType) -> Result<bool> {
         if let Some(event) = self.event_map.read().await.get(event_type) {
-            event.set_state(EventState::Intercepted)
+            event.sender.send(EventState::Intercepted).await?;
+            Ok(event.set_state(EventState::Intercepted))
         } else {
-            false
+            Ok(false)
         }
     }
     /// Cancels a specified event before it reaches deadline, this can be use for a different case
     /// where `intercept_event` is not ideal.
-    pub(crate) async fn cancel_event(&self, event_type: &EventType) -> bool {
+    pub(crate) async fn cancel_event(&self, event_type: &EventType) -> Result<bool> {
         if let Some(event) = self.event_map.read().await.get(event_type) {
-            event.set_state(EventState::Cancelled)
+            event.sender.send(EventState::Cancelled).await?;
+            Ok(event.set_state(EventState::Cancelled))
         } else {
-            false
+            Ok(false)
         }
     }
 
     // Remove event from event mapping.
-    async fn remove_event(&self, event_type: &EventType) -> Option<Arc<Event>> {
+    pub(crate) async fn remove_event(&self, event: &Event) -> Option<Arc<Event>> {
         let mut event_map = self.event_map.write().await;
-        event_map.remove(event_type)
+        event_map.remove(&event.event_type)
     }
 }
 
@@ -186,8 +192,6 @@ impl EventScheduler {
 pub(crate) struct EventStream {
     scheduler: Arc<EventScheduler>,
     lobby: BinaryHeap<TimestampedEvent>,
-    #[pin]
-    sleep: Pin<Box<Sleep>>,
 }
 
 impl EventStream {
@@ -196,7 +200,6 @@ impl EventStream {
         EventStream {
             scheduler,
             lobby: BinaryHeap::new(),
-            sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
         }
     }
     // Move event stream from events(`SegQueue`) from incoming to lobby for processing
@@ -217,17 +220,9 @@ impl EventStream {
         }
         moved_events
     }
-    // Peek into the lobby and calculate time for the next deadline.
-    fn time_until_next_event(&self) -> Option<Duration> {
-        self.lobby.peek().map(|event| {
-            let now = Instant::now();
-            if event.deadline > now {
-                event.deadline - now
-            } else {
-                // do it now.
-                Duration::from_secs(0)
-            }
-        })
+    // Peek into the lobby and picks the deadline for the next event.
+    fn deadline_of_next_event(&self) -> Option<Instant> {
+        self.lobby.peek().map(|event| event.deadline)
     }
 }
 
@@ -236,7 +231,6 @@ impl Stream for EventStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let moved_events = self.move_incoming_events_to_lobby();
-
         // Process events from the lobby(`BinaryHeap`).
         while let Some(TimestampedEvent { deadline, event }) = self.lobby.pop() {
             // Double-check the deadline in case time has passed since moving events
@@ -256,59 +250,104 @@ impl Stream for EventStream {
             }
         }
 
-        if let Some(next_deadline) = self.time_until_next_event() {
-            let deadline = Instant::now() + next_deadline;
-            // TODO: we shouldn't be setting a new pin.
-            let new_sleep = Box::pin(tokio::time::sleep_until(deadline));
-            self.as_mut().project().sleep.as_mut().set(new_sleep);
-        }
 
-        // If we moved events but couldn't process any, we need to try again soon
-        if moved_events {
-            cx.waker().wake_by_ref();
+        let waker = cx.waker().clone();
+        let notify = self.scheduler.new_event_notify.clone();
+        if let Some(next_deadline) = self.deadline_of_next_event() {
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = sleep_until(next_deadline) => {},
+                    _ = notify.notified() => {},
+                }
+                waker.wake();
+            });
             return Poll::Pending;
         }
 
-        // Check if the sleep future is ready
-        match self.project().sleep.poll(cx) {
-            Poll::Ready(_) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        // Schedule a task that will tell the runtime to check back on me 
+        // when i receive a new event notification.
+        tokio::spawn(async move {
+            notify.notified().await;
+            waker.wake();
+        });
+
+        return Poll::Pending;
     }
 }
 
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
     use super::*;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn test_intercept_event() {
-        let manager = EventScheduler::new();
+        let scheduler = EventScheduler::new();
         let now = Instant::now();
         let event_type = EventType::SuspectTimeout { node: "node".to_string() };
         
-        let (mut receiver, _) = manager.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await.unwrap();
+        let (mut receiver, _) = scheduler.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await.unwrap();
         
-        assert!(manager.intercept_event(&event_type).await);
+        assert!(scheduler.intercept_event(&event_type).await.expect("should intercept"));
         
         let result = timeout(Duration::from_millis(100), receiver.recv()).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(EventState::Intercepted));
     }
+    #[tokio::test]
+    async fn test_event_stream() {
+        let scheduler = Arc::new(EventScheduler::new());
+        let event_stream = EventStream::new(scheduler.clone());
+        let mut stream = pin!(event_stream);
+
+        // Schedule multiple events
+        let now = Instant::now();
+        let event_type1 = EventType::SuspectTimeout { node: "node1".to_string() };
+        let event_type2 = EventType::Ack { sequence_number: 1 };
+        let event_type3 = EventType::SuspectTimeout { node: "node2".to_string() };
+
+        scheduler.schedule_event(event_type1.clone(), now + Duration::from_millis(100)).await.unwrap();
+        scheduler.schedule_event(event_type2.clone(), now + Duration::from_millis(200)).await.unwrap();
+        scheduler.schedule_event(event_type3.clone(), now + Duration::from_millis(300)).await.unwrap();
+
+        // Use a timeout to prevent infinite waiting
+        let timeout_duration = Duration::from_secs(1);
+
+        // Aggregate events
+        let mut received_events = Vec::new();
+        while let Ok(Some(event)) = timeout(timeout_duration, futures::StreamExt::next(&mut stream)).await {
+            received_events.push(event.event_type.clone());
+            if received_events.len() == 3 {
+                break;
+            }
+        }
+
+        // Assert received events
+        assert_eq!(received_events.len(), 3, "Expected to receive 3 events");
+        assert_eq!(received_events[0], event_type1);
+        assert_eq!(received_events[1], event_type2);
+        assert_eq!(received_events[2], event_type3);
+
+        // Check event states
+        for event_type in &[event_type1, event_type2, event_type3] {
+            if let Some(event) = scheduler.event_map.read().await.get(event_type) {
+                assert_eq!(event.get_state(), EventState::ReachedDeadline);
+            } else {
+                panic!("Event {:?} not found in the map", event_type);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_duplicate_event_type() {
-        let manager = EventScheduler::new();
+        let scheduler = EventScheduler::new();
         let now = Instant::now();
         let event_type = EventType::SuspectTimeout { node: "node".to_string() };
         
-        manager.schedule_event(event_type.clone(), now).await.unwrap();
-        let result = manager.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await;
+        scheduler.schedule_event(event_type.clone(), now).await.unwrap();
+        let result = scheduler.schedule_event(event_type.clone(), now + Duration::from_secs(1)).await;
         
         assert!(result.is_err());
     }
