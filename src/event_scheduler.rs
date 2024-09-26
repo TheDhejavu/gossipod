@@ -2,7 +2,6 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock};
 use pin_project::pin_project;
-use tracing::debug;
 use std::{
     pin::Pin,
     task::{Context, Poll},
