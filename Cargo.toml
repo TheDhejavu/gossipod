@@ -27,4 +27,5 @@ rand = "0.8.5"
 pin-project = "1.1.5"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.10", features = ["env-filter"] }
+crossbeam = "0.8.4"
 

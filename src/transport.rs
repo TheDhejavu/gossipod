@@ -57,10 +57,17 @@ impl DefaultTransport {
         let private_ip_addr = IpAddress::find_system_ip()?;
         if addr.ip().to_string() == DEFAULT_IP_ADDR || addr.ip().to_string() == "0.0.0.0" {
             info!(
-                "> [UDP] Binding to all network interfaces: {}:{} (Private IP: {}:{})",
+                "> [UDP] Binding to all network interfaces: {}:{} (Private IPv4: {}:{})",
                 addr.ip(),
                 addr.port(),
-                private_ip_addr.to_string(),
+                private_ip_addr.0.to_string(),
+                addr.port(),
+            );
+            info!(
+                "> [UDP] Binding to all network interfaces: {}:{} (Private IPv6: {}:{})",
+                addr.ip(),
+                addr.port(),
+                private_ip_addr.1.to_string(),
                 addr.port(),
             );
         } else {

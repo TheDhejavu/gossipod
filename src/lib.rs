@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use anyhow::{anyhow, Context as _, Result};
 use codec::MessageCodec;
+use futures::Stream as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 use tokio::macros::support::poll_fn;
 pub use broadcast_queue::{BroadcastQueue, DefaultBroadcastQueue};
 pub use  dispatch_event_handler::DispatchEventHandler;
 use rand::{thread_rng, Rng};
 use config::{BROADCAST_FANOUT, INDIRECT_REQ, MAX_UDP_PACKET_SIZE};
-use event_scheduler::{EventState, EventType};
+use event_scheduler::{EventState, EventStream, EventType};
 use tracing::{info, warn, error, debug, instrument};
 use members::MergeAction;
 use message::{AckPayload, AppMsgPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
@@ -26,7 +27,6 @@ use transport::{ListenerEvent, TcpConnectionListener};
 use utils::pretty_debug;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
-use std::time::Duration;
 use crate::{
     config::GossipodConfig,
     event_scheduler::EventScheduler,
@@ -145,8 +145,8 @@ where
     /// Incarnation number, used to detect and handle node restarts
     incarnation: AtomicU64,
 
-    /// Manager for handling and creating of events
-    event_scheduler: EventScheduler,
+    /// Manager for handling and creating timestamped events
+    event_scheduler: Arc<EventScheduler>,
 
     // broadcasts represents outbound messages to peers
     // when it's not set, it defaults to DefaultBroadcastQueue
@@ -215,6 +215,7 @@ where
         let (shutdown_tx, _) = broadcast::channel(1);
         let addr = transport.local_addr().map_err(|e|anyhow!(e))?;
 
+        let event_scheduler = Arc::new(EventScheduler::new());
         let swim = Self {
             inner: Arc::new(InnerGossipod {
                 config,
@@ -225,7 +226,7 @@ where
                 transport,
                 sequence_number: AtomicU64::new(0),
                 incarnation: AtomicU64::new(0),
-                event_scheduler: EventScheduler::new(),
+                event_scheduler: event_scheduler,
                 broadcasts,
                 dispatch_event_handler,
             })
@@ -385,45 +386,42 @@ where
 
     pub(crate) fn launch_event_scheduler(&self, mut shutdown_rx: broadcast::Receiver<()>) -> tokio::task::JoinHandle<Result<()>> {
         let gossipod = self.clone();
-        
+        let scheduler_event_stream = EventStream::new(self.inner.event_scheduler.clone());
         tokio::spawn(async move {
+            let mut event_stream = pin!(scheduler_event_stream);
             loop {
-                let sleep_duration = gossipod.inner.event_scheduler.time_to_next_event().await.unwrap_or(Duration::from_millis(500));
-
                 tokio::select! {
-                    _ = tokio::time::sleep(sleep_duration) => {
-                        let cluster_size = gossipod.inner.members.len().unwrap_or(gossipod.inner.config.initial_cluster_size);
-                        // Calculate event processing limit to balance performance and resource usage:
-                        // 1. Slow down processing if message volume is high
-                        // 2. Events are created for most pings/ping-req so it's important to the drain channel quickly to reduce memory overhead
-                        // 3. Avoid CPU spikes from processing too many messages at once
-                        // 4. Scale with cluster size, but within reasonable bounds (100-1000)
-                        // Note: This is a naive approach and may need tuning for optimal performance
-                        let limit = std::cmp::min(
-                            std::cmp::max(100, cluster_size), 
-                            1000
-                        );
-                        let events = gossipod.inner.event_scheduler.next_events(limit).await;
-                        for (event_type, event) in events {
-                            match event_type {
-                                EventType::Ack { sequence_number } => {
-                                    info!("Ack with sequence number {} TIMED OUT", sequence_number);
-                                    let _ = event.sender.try_send(event.state);
-                                },
-                                EventType::SuspectTimeout { node } => {
-                                    info!("Moving Node {} to DEAD state", node);
-                                    if let Ok(Some(node)) = gossipod.inner.members.get_node(&node) {
-                                        if node.is_suspect() {
-                                            if let Err(e)= gossipod.confirm_node_dead(&node).await {
-                                                warn!("unable to confirm dead for node: {} because of: {}", node.name, e);
-                                            }else {
-                                                info!("Successfully Moved node {} to DEAD state", node.name);
-                                            }
-                                
-                                        }
-                                    };
-                                },
+                    event = poll_fn(|cx| event_stream.as_mut().poll_next(cx)) => {
+                        debug!("====== Poll: Event Stream =========");
+                        if let Some(current_event) = event {
+                            match current_event.get_state() {
+                                EventState::ReachedDeadline => {
+                                    match &current_event.event_type {
+                                        EventType::Ack { sequence_number } => {
+                                            debug!("Ack with sequence number {} TIMED OUT", sequence_number);
+                                            let _ = current_event.sender.try_send(current_event.get_state());
+                                        },
+                                        EventType::SuspectTimeout { node } => {
+                                            debug!("Moving Node {} to DEAD state", node);
+                                            if let Ok(Some(node)) = gossipod.inner.members.get_node(&node) {
+                                                if node.is_suspect() {
+                                                    if let Err(e)= gossipod.confirm_node_dead(&node).await {
+                                                        warn!("unable to confirm dead for node: {} because of: {}", node.name, e);
+                                                    }else {
+                                                        info!("Successfully Moved node {} to DEAD state", node.name);
+                                                    }
+                                        
+                                                }
+                                            };
+                                        },
+                                    }
+                                }
+                                _ => {
+                                    // Event was intercepted or cancelled, no action needed
+                                }
                             }
+                            // Ensure to remove event.
+                            gossipod.inner.event_scheduler.remove_event(&current_event).await;
                         }
                     }
                     _ = shutdown_rx.recv() => {
