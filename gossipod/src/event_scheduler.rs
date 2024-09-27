@@ -249,7 +249,6 @@ impl Stream for EventStream {
             }
         }
 
-
         let waker = cx.waker().clone();
         let notify = self.scheduler.new_event_notify.clone();
         if let Some(next_deadline) = self.deadline_of_next_event() {
