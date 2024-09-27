@@ -1,0 +1,45 @@
+[package]
+name = "pong_node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# gossipod
+gossipod.workspace = true
+
+# serialize and deserialize
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+
+# error Handling
+anyhow.workspace = true
+
+# async
+tokio.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+
+# data Structures
+uuid.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+bytes.workspace = true
+crossbeam.workspace = true
+
+# logging & tracing
+env_logger.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# cli
+clap.workspace = true
+[[bin]]
+name = "pong_node"
+path = "src/pong_node.rs"

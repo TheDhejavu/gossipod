@@ -86,12 +86,12 @@ includes a number of demos. Below you can run two different instances of gossipo
 
 #### Node_1 as a standalone
 ```sh
-> cargo run --example ping_node -- --name=NODE_1 --port=7948 
+> cargo run -p ping_node -- --name=NODE_1 --port=7948
 ```
 
 #### Node_2 with initial join to node_1
 ```sh
-> cargo run --example pong_node -- --name=NODE_2 --port=7947 --join-addr=127.0.0.1:7948
+> cargo run -p pong_node -- --name=NODE_2 --port=7947 --join-addr=127.0.0.1:7948
 ```
 
 # Gossipod API
