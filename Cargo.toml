@@ -10,8 +10,8 @@ authors = ["Ayodeji Akinola <akinayodeji4all@gmail.com>"]
 [workspace]
 members = [
     "gossipod",
-    "examples/*"
-    # "runtime",
+    "gossipod-runtime",
+    "examples/*",
 ]
 resolver = "2"
 
@@ -21,7 +21,7 @@ debug = true
 [workspace.dependencies]
 # Gossipod
 gossipod = { path = "./gossipod" }
-# gossipod-runtime = { path = "./gossipod-runtime" }
+gossipod-runtime = { path = "./gossipod-runtime" }
 
 # Serialize and Deserialize
 serde = { version = "1.0.136", features = ["derive"] }

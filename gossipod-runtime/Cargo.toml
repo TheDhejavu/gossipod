@@ -1,0 +1,25 @@
+[package]
+name = "gossipod-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+crossbeam.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+pin-project.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# Non-workspace dependency
+rayon = "1.10.0"
+lazy_static = "1.5.0"
+metrics = "0.23.0"
