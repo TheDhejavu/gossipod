@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use gossipod_runtime::{ActorCommand, Runtime};
+
+use crate::event_scheduler::Event;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub(crate) enum ActorId {
@@ -9,8 +13,7 @@ pub(crate) enum ActorId {
 
 #[derive(Debug)]
 pub(crate) enum GossipodCommand {
-    Probe(String),
-    Gossip(String),
+    EventScheduler(Arc<Event>),
 }
 
 impl ActorCommand for GossipodCommand {}

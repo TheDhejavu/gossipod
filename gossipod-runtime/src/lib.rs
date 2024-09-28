@@ -9,7 +9,8 @@ use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use metrics::METRICS;
 use pin_project::pin_project;
-use tracing::error;
+use tracing::{error, info};
+use tokio::task::JoinSet;
 use std::pin::pin;
 use std::time::Instant;
 use rayon::ThreadPool;
@@ -27,6 +28,15 @@ use std::{
     task::{Context, Poll},
 };
 mod metrics;
+
+// ===== REFACTOR ========= 
+// 1. Recurrent Actor does one thing, it excutes its handler periodically without any command, remove the command from this type of actors
+// 2. Poll Actors does one thing, they executes a join set of futures thats polls , response received will execute 
+//    the join set actor handler. Their goal is to poll something till whenever 
+// 3. Execute Now executes any given futures in the moment
+// 4. Consumer Actors, they can be short-lived or run forever, the listen to commands and rexecutes their command handler,if excution time has 
+// passed it shuts down, if its set to run forever it stays alive. good for producer consumer cases, this one makes uses of 
+// raynnon thread pool
 
 // [`ActorCommand`] ths command is specific to actors, different actors
 // can have different commands that does specific things and sometimes we 
@@ -46,7 +56,7 @@ pub struct RuntimeConfig {
 //       - etc
 pub struct Runtime<T, C>
 where 
-    T: Hash + Eq + Clone + Send + Sync + 'static,
+    T: Hash + Eq + Debug + Clone + Send + Sync + 'static,
     C: ActorCommand
 {
     // Represents actors in the runtime, 0. represents the sender channel for incoming
@@ -54,14 +64,16 @@ where
     // TODO: introduce runtime-specific command for managing actors E.g PAUSE,IDLE, RESUME, SHUTDOWN, to 
     // manage the lifecycle of the actor thread, this will also be useful for shutting down IDLE thread after
     // a period of time using `last_active` 
-    actors: DashMap<T, (mpsc::UnboundedSender<C>, broadcast::Sender<()>)>,
+    actors: DashMap<T, (Option<mpsc::UnboundedSender<C>>, broadcast::Sender<()>)>,
 
-    // thread pool queue using lock-free SeqQueue, having an entry queue allows
-    // a more fine-grained execution of tasks that's non-blocking, it accepts `Box::pin(future)`
-    // because we want to allocate the future on a heap.
-    // thread_pool_queue: Arc<SegQueue<BoxFuture<'static, ()>>>,
+    // keep tracks of all poll-based actors.
+    // actors doesn't share raynon thread pool, they run in their own seperate tokio thread
+    // they mostly react to `Poll::Ready` events, this mostly is applicable to channel receivers or 
+    // any form of future that is poll-based, infact you can turn almost any event to a poll if you
+    // wrap it around `Future::Stream` or implements a `Future` that is guaranteed to resolve.
+    // actors: DashMap<T, Actor<T, C>>,
 
-    // Rayon thread pool for executing tasks
+    // Rayon thread pool for executing tasks.
     thread_pool: Arc<ThreadPool>,
 
     // runtime configuration
@@ -72,34 +84,42 @@ where
 pub struct Actor<T, C>
 where
     T: Hash + Debug + Eq  + Clone + Send + Sync + 'static,
-    C: ActorCommand,
 {
     id: T,
-    
-    command_handler: Box<dyn Fn(Option<C>) -> BoxFuture<'static, ()> + Send + Sync>,
 
-    // shutdown signal for actor:
-    shutdown: broadcast::Sender<()>,
+    // handler for actor.
+    handler: Box<dyn Fn(C) -> BoxFuture<'static, ()> + Send + Sync>,
 }
 
 #[pin_project]
-pub struct RecurrentActor<T, C>
+pub struct RecurrentActor<T>
 where
     T: Hash + Debug + Eq + Clone + Send + Sync + 'static,
-    C: ActorCommand,
 {
-    // actor
-    actor: Actor<T, C>,
+    id: T,
+
+    // handler for actor.
+    handler: Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
 
     // Interval for recurrent actor.
     #[pin]
     interval: tokio::time::Interval,
 }
 
-impl<T, C> Stream for RecurrentActor<T, C>
+pub struct ConsumerActor<T, C>
 where
     T: Hash + Debug + Eq + Clone + Send + Sync + 'static,
-    C: ActorCommand,
+    C: ActorCommand
+{
+    id: T,
+
+    // handler for actor.
+    handler: Box<dyn Fn(C) -> BoxFuture<'static, ()> + Send + Sync>,
+}
+
+impl<T> Stream for RecurrentActor<T>
+where
+    T: Hash + Debug + Eq + Clone + Send + Sync + 'static,
 {
     type Item = ();
 
@@ -176,7 +196,7 @@ impl RuntimeBuilder {
     /// * `C` - The actor command type.
     pub fn build<T, C>(self) -> Arc<Runtime<T, C>>
     where
-        T: Hash + Eq + Clone + Send + Sync + 'static,
+        T: Hash + Eq + Debug + Clone + Send + Sync + 'static,
         C: ActorCommand,
     {
         let thread_pool = rayon::ThreadPoolBuilder::new()
@@ -198,27 +218,34 @@ impl RuntimeBuilder {
 #[async_trait::async_trait]
 pub trait RuntimeExt<T, C>: Send + Sync + 'static 
 where
-    T: Hash + Eq + Clone + Send + Sync + 'static,
-    C: ActorCommand,
+    T: Hash + Eq + Debug + Clone + Send + Sync + 'static,
+    C: ActorCommand
 {
     /// Spawn a future to be executed in the runtime thread pool immediately.
-    async fn execute_now<F, Fut>(&self, future: F) -> Result<()>
+    async fn execute_now<F>(&self, future: F) -> Result<()>
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static;
+        F: Future + Send + 'static,
+        F::Output: Send + 'static;
 
-    /// Send a command to an actor.
-    async fn send_command(&self, actor_id: &T, command: C) -> Result<()>;
+    /// Try to Send a command to an actor (consumer actors) in order to perform some actions.
+    async fn try_send_command(&self, actor_id: &T, command: C) -> Result<()>;
 
     /// Spawn an actor with its handler
-    async fn spawn_actor<F>(&self, actor_id: T, command_handler: F) -> Result<()>
+    async fn spawn_actor<F, H>(&self, actor_id: T, futures: Vec<F>, handler: H) -> Result<()>
     where
-        F: Fn(Option<C>) -> BoxFuture<'static, ()> + Send + Sync + 'static;
+        F: Future<Output = C> + Send + 'static,
+        H: Fn(C) -> BoxFuture<'static, ()> + Send + Sync + 'static;
 
     /// Spawn a recurrent actor that repeatedly calls its handler based on internal state
     async fn spawn_recurrent_actor<F>(&self, actor_id: T, initial_interval: Duration, command_handler: F) -> Result<()>
     where
-        F: Fn(Option<C>) -> BoxFuture<'static, ()> + Send + Sync + 'static;
+        F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static;
+
+    /// Spawn an actor that processes items from a stream
+    async fn spawn_actor_on_stream<S, H>(&self, actor_id: T, stream: S, handler: H) -> Result<()>
+    where
+        S: Stream<Item = C> + Send + 'static,
+        H: Fn(C) -> BoxFuture<'static, ()> + Send + Sync + 'static;
 
     /// Destroy a spawned actor by its ID
     async fn destroy_actor(&self, actor_id: &T) -> Result<()>;
@@ -246,57 +273,94 @@ where
     /// * Add a mechanism to dynamically adjust the recurring interval.
     ///
     async fn run_recurrent_actor(
-        mut recurrent_actor: RecurrentActor<T, C>, 
-        mut actor_receiver: mpsc::UnboundedReceiver<C>,
+        mut recurrent_actor: RecurrentActor<T>, 
+        mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let mut shutdown_rx = recurrent_actor.actor.shutdown.subscribe();
         let mut pinned_actor = pin!(recurrent_actor);
         loop {
             tokio::select! {
-                Some(command) = actor_receiver.recv() => {
-                    let start = Instant::now();
-                    let fut = (pinned_actor.actor.command_handler)(Some(command));
-                    fut.await;
-                    let duration = start.elapsed();
-                    
-                    METRICS.actor_command_throughput.increment(1);
-                    METRICS.actor_command_latency.record(duration.as_secs_f64());
-                }
                 _ = poll_fn(|cx| pinned_actor.as_mut().poll_next(cx)) => {
                     println!("==== Execute Recurring task =====");
-                    let fut = (pinned_actor.actor.command_handler)(None);
+                    let fut = (pinned_actor.handler)();
                     fut.await;
                 },
                 _ = shutdown_rx.recv() => {
-                    METRICS.total_actors.decrement(1.0);
                     break;
                 }
             }
         }
+        METRICS.total_actors.decrement(1.0);
+        info!("Actor {:?} shut down", pinned_actor.id);
     }
     /// Manages the lifecycle and execution of a standard actor.
     ///
     /// It handles the main loop for a standard actor, processing incoming commands
     /// until a shutdown signal is received.
-    async fn run_actor(actor: Actor<T, C>,  mut actor_receiver: mpsc::UnboundedReceiver<C>) {
-        let mut shutdown_rx = actor.shutdown.subscribe();
+    async fn run_actor(
+        actor: Actor<T, C>,
+        futures: Vec<BoxFuture<'static, C>>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) {
+        let mut join_set = JoinSet::new();
+    
+        // 1. Spawn initial futures
+        for future in futures {
+            join_set.spawn(future);
+        }
+    
         loop {
             tokio::select! {
-                Some(command) = actor_receiver.recv() => {
-                    let start = Instant::now();
-                    let fut = (actor.command_handler)(Some(command));
-                    fut.await;
-                    let duration = start.elapsed();
-                    
-                    METRICS.actor_command_throughput.increment(1);
-                    METRICS.actor_command_latency.record(duration.as_secs_f64());
+                Some(result) = join_set.join_next() => {
+                    match result {
+                        Ok(value) => {
+                            // 2. Execute handler on result value.
+                            let fut = (actor.handler)(value);
+                            fut.await;
+                        },
+                        Err(e) => error!("Actor task failed: {:?}", e)
+                    }
+                    if join_set.is_empty() {
+                        break;
+                    }
                 }
                 _ = shutdown_rx.recv() => {
-                    METRICS.total_actors.decrement(1.0);
+                    info!("Actor {:?} received shutdown signal", actor.id);
                     break;
                 }
             }
         }
+    
+        // 3. Clean up future join set
+        join_set.abort_all();
+        METRICS.total_actors.decrement(1.0);
+        info!("Actor {:?} shut down", actor.id);
+    }
+
+    async fn run_stream_actor<S>(
+        actor: Actor<T, C>,
+        mut stream: S,
+        shutdown_tx: broadcast::Sender<()>,
+    ) where
+        S: Stream<Item = C> + Send + 'static,
+    {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let mut event_stream = pin!(stream);
+        loop {
+            tokio::select! {
+                Some(item) = poll_fn(|cx| event_stream.as_mut().poll_next(cx)) => {
+                    let fut = (actor.handler)(item);
+                    fut.await;
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Actor {:?} received shutdown signal", actor.id);
+                    break;
+                }
+                else => break,
+            }
+        }
+    
+        METRICS.total_actors.decrement(1.0);
+        info!("Actor {:?} shut down", actor.id);
     }
 }
 
@@ -319,14 +383,14 @@ where
     ///     println!("Executing a task in the thread pool");
     /// }).await.unwrap();
     /// ```
-    async fn execute_now<F, Fut>(&self, future: F) -> Result<()>
+    async fn execute_now<F>(&self, future: F) -> Result<()>
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
     {
-        let runtime = tokio::runtime::Handle::current();
+        let rt = tokio::runtime::Handle::current();
         self.thread_pool.spawn(move || {
-            runtime.block_on(future());
+            rt.block_on(future);
         });
         Ok(())
     }
@@ -341,13 +405,16 @@ where
     /// # Examples
     ///
     /// ```ignore
-    /// runtime.send_command(&ActorId("probing".to_string()), Command::Probe("node1".to_string())).await.unwrap();
+    /// runtime.try_send_command(&ActorId("probing".to_string()), Command::Probe("node1".to_string())).await.unwrap();
     /// ```
-    async fn send_command(&self, actor_id: &T, command: C) -> Result<()> {   
+    async fn try_send_command(&self, actor_id: &T, command: C) -> Result<()> {   
         let result = if let Some(actor) = self.actors.get(actor_id) {
-            actor.0.send(command).map_err(|_| anyhow!("Failed to send command to actor."))
+            if let Some(sender) = &actor.0 {
+                sender.send(command).map_err(|_| anyhow!("Failed to send command to actor."))?;
+            }
+            Err(anyhow!("Consumer Actor not found".to_string()))
         } else {
-            Err(anyhow!("Actor not found".to_string()))
+            Err(anyhow!("Consumer Actor not found".to_string()))
         };
 
         if result.is_err() {
@@ -374,29 +441,32 @@ where
     ///     })
     /// }).await.unwrap();
     /// ```
-    async fn spawn_actor<F>(&self, actor_id: T, command_handler: F) -> Result<()>
-     where
-        F: Fn(Option<C>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    async fn spawn_actor<F, H>(&self, actor_id: T, futures: Vec<F>, handler: H) -> Result<()>
+    where
+        F: Future<Output = C> + Send + 'static,
+        H: Fn(C) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
         METRICS.total_actors.increment(1.0);
-        // create sender and receiver channel for actor.
-        let (sender, receiver)  = mpsc::unbounded_channel();
-        let (shutdown_tx, _) = broadcast::channel(1);
 
+        // let (sender, _) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let actor = Actor {
             id: actor_id.clone(),
-            shutdown: shutdown_tx.clone(),
-            command_handler: Box::new(command_handler),
+            handler: Box::new(handler),
         };
 
         // Insert actor into actors.
-        self.actors.insert(actor_id.clone(),(sender, shutdown_tx));
-    
-        // Spawn new actor
-        tokio::spawn(async move {
-            Self::run_actor(actor, receiver).await;
-        });
+        self.actors.insert(actor_id.clone(),(None, shutdown_tx));
+
+        let boxed_futures: Vec<BoxFuture<'static, C>> = futures
+            .into_iter()
+            .map(|f| Box::pin(f) as BoxFuture<'static, C>)
+            .collect();
         
+        tokio::spawn(async move {
+            Self::run_actor(actor, boxed_futures, shutdown_rx).await;
+        });
+
         Ok(())
     }
 
@@ -421,33 +491,55 @@ where
     ///     }
     /// ).await.unwrap();
     /// ```
-    async fn spawn_recurrent_actor<F>(&self, actor_id: T, initial_interval: Duration, command_handler: F) -> Result<()>
+    async fn spawn_recurrent_actor<F>(&self, actor_id: T, initial_interval: Duration, handler: F) -> Result<()>
      where
-        F: Fn(Option<C>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+        F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
         // Create sender and receiver channel for actor.
-        let (sender, receiver)  = mpsc::unbounded_channel();
-        let (shutdown_tx, _) = broadcast::channel(1);
+        // let (sender, receiver)  = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-        let actor = Actor {
+        let recurrent_actor = RecurrentActor {
             id: actor_id.clone(),
-            shutdown: shutdown_tx.clone(),
-            command_handler: Box::new(command_handler),
-        };
-        
-        let recurrent_actor: RecurrentActor<T, C> = RecurrentActor {
-            actor,
+            handler: Box::new(handler),
             interval: interval(initial_interval),
         };
 
         // Insert actor into actors.
-        self.actors.insert(actor_id.clone(),(sender, shutdown_tx));
+        self.actors.insert(actor_id.clone(),(None, shutdown_tx));
 
         // Spawn new actor
         tokio::spawn(async move {
-            Self::run_recurrent_actor(recurrent_actor, receiver).await;
+            Self::run_recurrent_actor(recurrent_actor, shutdown_rx).await;
         });
         
+        Ok(())
+    }
+
+    async fn spawn_actor_on_stream<S, H>(&self, actor_id: T, stream: S, handler: H) -> Result<()>
+    where
+        S: Stream<Item = C> + Send + 'static,
+        H: Fn(C) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    {
+        METRICS.total_actors.increment(1.0);
+
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let actor = Actor {
+            id: actor_id.clone(),
+            handler: Box::new(handler),
+        };
+
+        // Insert actor into actors.
+        self.actors.insert(actor_id.clone(), (None, shutdown_tx.clone()));
+
+        tokio::spawn(async move {
+            Self::run_stream_actor(actor, stream, shutdown_tx).await;
+        });
+
+        if let Err(e) = self.destroy_actor(&actor_id).await {
+            error!("Error destroying actor {:?}: {}", actor_id, e);
+        }
+
         Ok(())
     }
 
@@ -528,10 +620,12 @@ mod tests {
         let task_executed = Arc::new(RwLock::new(false));
         let task_executed_clone = task_executed.clone();
 
-        runtime.execute_now(move || async move {
+        runtime.execute_now(async move {
             let mut executed = task_executed_clone.write();
             *executed = true;
         }).await.unwrap();
+
+        tokio::spawn(async move {});
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 

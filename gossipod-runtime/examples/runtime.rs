@@ -2,7 +2,6 @@ use std::time::Duration;
 use gossipod_runtime::{ActorCommand, Runtime, RuntimeExt};
 use tokio::time::sleep_until;
 
-
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 enum ExActorId {
     RandomActor(String),
@@ -26,47 +25,40 @@ async fn main() {
         .with_metrics_enabled(true)
         .build::<ExActorId, ExCommand>();
 
-    runtime.spawn_actor(ExActorId::RandomActor("actor1".to_string()), |command| {
-        Box::pin(async move {
-            match command {
-               Some(cmd) => {
-                    match  cmd {
-                        ExCommand::Probe(node) => println!("Probing node: {}", node),
-                        ExCommand::Gossip(msg) => println!("Gossiping: {}", msg),
-                        _ => println!("Unhandled command: {:?}", cmd),
-                    };
-               }
-               _ => println!("command is none."),
-            }
-        })
-    }).await.unwrap();
-
-    // Spawn a recurrent SWIM protocol actor for periodic tasks
-    runtime.spawn_recurrent_actor(
-        ExActorId::PeriodicActor("actor2".to_string()),
-        Duration::from_secs(1),
+    // Spawn a regular actor
+    runtime.spawn_actor(
+        ExActorId::RandomActor("actor1".to_string()),
+        vec![async { ExCommand::Probe("node1".to_string()) }],
         |command| {
             Box::pin(async move {
                 match command {
-                    Some(cmd) => {
-                        match  cmd {
-                            ExCommand::Probe(node) => println!("Probing node: {}", node),
-                            ExCommand::Gossip(msg) => println!("Gossiping: {}", msg),
-                            _ => println!("Unhandled command: {:?}", cmd),
-                        };
-                    }
-                    _ => println!("_"),
-                 }
+                    ExCommand::Probe(node) => println!("Probing node: {}", node),
+                    ExCommand::Gossip(msg) => println!("Gossiping: {}", msg),
+                }
             })
         }
     ).await.unwrap();
 
-    runtime.execute_now(|| async {
+    // Spawn a recurrent actor
+    runtime.spawn_recurrent_actor(
+        ExActorId::PeriodicActor("actor2".to_string()),
+        Duration::from_secs(1),
+        || {
+            Box::pin(async move {
+                println!("Performing periodic task");
+            })
+        }
+    ).await.unwrap();
+
+    runtime.execute_now(async move {
         println!("Executing a task in the thread pool");
     }).await.unwrap();
 
-    sleep_until(tokio::time::Instant::now() + Duration::from_millis(10_000)).await;
+    // Send a command to the regular actor
+    // runtime.try_send_command(&ExActorId::RandomActor("actor1".to_string()), ExCommand::Gossip("Hello".to_string())).await.unwrap();
+
+    sleep_until(tokio::time::Instant::now() + Duration::from_secs(10)).await;
     runtime.destroy().await.unwrap();
 
-    println!("==  Greacefully destroyed runtime === ");
+    println!("== Gracefully destroyed runtime ===");
 }

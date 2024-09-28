@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
     }
 
     node.run().await?;
+    // node.stop().await?;
 
     info!("[PROCESS] Gossipod has been stopped");
     Ok(())
