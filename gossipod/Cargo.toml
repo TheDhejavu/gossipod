@@ -8,10 +8,10 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
-[profile.release]
-debug = true
-
 [dependencies]
+# gossipod
+gossipod-runtime.workspace = true
+
 # serialize and deserialize
 serde.workspace = true
 serde_json.workspace = true

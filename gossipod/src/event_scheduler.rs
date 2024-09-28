@@ -13,6 +13,8 @@ use std::cmp::Ordering as CmpOrdering;
 use futures::stream::Stream;
 use crossbeam::queue::SegQueue;
 
+use crate::runtime::GossipodCommand;
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum EventType {
     Ack { sequence_number: u64 },
@@ -226,7 +228,7 @@ impl EventStream {
 }
 
 impl Stream for EventStream {
-    type Item = Arc<Event>;
+    type Item = GossipodCommand;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let moved_events = self.move_incoming_events_to_lobby();
@@ -237,11 +239,11 @@ impl Stream for EventStream {
             if deadline <= now {
                 // The event has reached its deadline
                 if event.set_state(EventState::ReachedDeadline) {
-                    return Poll::Ready(Some(event));
+                    return Poll::Ready(Some(GossipodCommand::EventScheduler(event)));
                 }
                 
                 // If set state failed then we are sure that event has probably been intercepted / cancelled.
-                return Poll::Ready(Some(event));
+                return Poll::Ready(Some(GossipodCommand::EventScheduler(event)));
             } else {
                 // If the event is still in the future, put it back into the lobby and stop processing
                 self.lobby.push(TimestampedEvent { deadline, event });
@@ -315,7 +317,7 @@ mod tests {
 
         // Aggregate events
         let mut received_events = Vec::new();
-        while let Ok(Some(event)) = timeout(timeout_duration, futures::StreamExt::next(&mut stream)).await {
+        while let Ok(Some(GossipodCommand::EventScheduler(event))) = timeout(timeout_duration, futures::StreamExt::next(&mut stream)).await {
             received_events.push(event.event_type.clone());
             if received_events.len() == 3 {
                 break;

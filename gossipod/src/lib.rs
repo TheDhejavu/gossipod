@@ -3,16 +3,19 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use anyhow::{anyhow, Context as _, Result};
 use codec::MessageCodec;
 use futures::Stream as _;
+use runtime::{ActorId, GossipodCommand, GossipodRuntime};
+use gossipod_runtime::{RuntimeExt};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 use tokio::macros::support::poll_fn;
 pub use broadcast_queue::{BroadcastQueue, DefaultBroadcastQueue};
 pub use  dispatch_event_handler::DispatchEventHandler;
 use rand::{thread_rng, Rng};
 use config::{BROADCAST_FANOUT, INDIRECT_REQ, MAX_UDP_PACKET_SIZE};
-use event_scheduler::{EventState, EventStream, EventType};
+use event_scheduler::{Event, EventState, EventStream, EventType};
 use tracing::{info, warn, error, debug, instrument};
 use members::MergeAction;
 use message::{AckPayload, AppMsgPayload, Broadcast, MessagePayload, MessageType, PingPayload, PingReqPayload};
@@ -52,6 +55,7 @@ mod event_scheduler;
 mod utils;
 mod broadcast_queue;
 mod mock_transport;
+mod runtime;
 mod dispatch_event_handler;
 
 // SWIM Protocol Implementation for GOSSIPOD
@@ -152,6 +156,9 @@ where
     // when it's not set, it defaults to DefaultBroadcastQueue
     pub(crate) broadcasts: Arc<dyn BroadcastQueue>,
 
+    // gossipod runtime for managing all thread execution
+    runtime: Arc<GossipodRuntime>,
+
     // Dispatch event handler is used for dispatching events based on memebership
     // state changes
     pub(crate) dispatch_event_handler: Option<Arc<dyn DispatchEventHandler<M>>>
@@ -216,6 +223,12 @@ where
         let addr = transport.local_addr().map_err(|e|anyhow!(e))?;
 
         let event_scheduler = Arc::new(EventScheduler::new());
+
+        let runtime: Arc<GossipodRuntime> = GossipodRuntime::builder()
+            .with_thread_pool_size(8)
+            .with_metrics_enabled(true)
+            .build::<ActorId, GossipodCommand>();
+
         let swim = Self {
             inner: Arc::new(InnerGossipod {
                 config,
@@ -228,6 +241,7 @@ where
                 incarnation: AtomicU64::new(0),
                 event_scheduler: event_scheduler,
                 broadcasts,
+                runtime,
                 dispatch_event_handler,
             })
         };
@@ -245,257 +259,159 @@ where
         self.launch_datagram_listener().await?;
         self.launch_tcp_listener().await?;
         
-        let probe_handle = self.launch_probe_scheduler(self.inner.shutdown.subscribe());
-        let gossip_handle = self.launch_gossip_scheduler(self.inner.shutdown.subscribe());
+        self.launch_prober().await?;
+        self.launch_gossiper().await?;
 
-        let event_scheduler_handler = self.launch_event_scheduler(self.inner.shutdown.subscribe());
-    
-        let shutdown_reason = self.handle_shutdown_signal(
-            probe_handle, 
-            gossip_handle,
-            event_scheduler_handler,
-            shutdown_rx,
-        ).await?;
+        self.launch_event_scheduler().await?;
 
-        if shutdown_reason != ShutdownReason::Termination {
-            self.inner.shutdown.send(()).
-                map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        }
+        self.wait_till_completion(shutdown_rx).await?;
+        Ok(())
+    }
 
+    async fn graceful_shutdown(&self) -> Result<()>{
+        let _ = self.inner.runtime.destroy().await;
         self.set_state(GossipodState::Stopped).await?;
         self.inner.transport.shutdown().await.map_err(|e|anyhow!(e))?;
         self.leave().await?;
 
-        info!("> [GOSSIPOD] Gracefully shut down due to {:?}", shutdown_reason);
-    
+        info!("> [GOSSIPOD] Gracefully shut down completed.");
         Ok(())
     }
 
     // handle shutdown signal
-    async fn handle_shutdown_signal(
+    async fn wait_till_completion(
         &self,
-        probe_handle: tokio::task::JoinHandle<Result<()>>,
-        gossip_handle: tokio::task::JoinHandle<Result<()>>,
-        event_scheduler_handler: tokio::task::JoinHandle<Result<()>>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<ShutdownReason> {
         tokio::select! {
-            _ = probe_handle => Ok(ShutdownReason::SchedulerFailure),
-            _ = gossip_handle => Ok(ShutdownReason::SchedulerFailure),
-            _ = event_scheduler_handler => Ok(ShutdownReason::SchedulerFailure),
             _ = shutdown_rx.recv() => {
                 info!("> [RECV] Initiating graceful shutdown..");
+                self.graceful_shutdown().await?;
                 Ok(ShutdownReason::Termination)
             }
         }
     }
 
-    fn launch_probe_scheduler(&self, mut shutdown_rx: broadcast::Receiver<()>) -> tokio::task::JoinHandle<Result<()>> {
-        let gossipod = Arc::new(self.clone());
-        let backoff = Arc::new(BackOff::new());
-        
-        // Probing is how we detect failure and Dissemination is how 
-        // we randomly broadcast message in an infectious-style
-        // E.G: When we discover a DEAD, ALIVE, SUSPECT Node, we can disseminate 
-        // the state change by broadcasting it
+    /// Launches the Gossipod prober.
+    ///
+    /// The prober is responsible for failure detection and information dissemination:
+    ///
+    /// Failure Detection (Probing):
+    /// 1. Pick a node at random using round-robin.
+    /// 2. Send a PING message to the node.
+    /// 3. If received, node sends back an ACK message.
+    /// 4. If failed, pick random nodes and send an INDIRECT PING-REQ for INDIRECT ACK.
+    /// 5. If successful, do nothing.
+    /// 6. If failed, mark the node as suspicious and disseminate the state change.
+    /// 7. If suspicious node is indeed dead, it's removed from the membership list.
+    /// 8. If not, the node must refute the suspicion and its alive state is reinstated.
+    ///
+    /// Information Dissemination:
+    /// - Use gossiping to disseminate node state changes to randomly selected nodes.
+    /// - Piggyback information on PING and PING-REQ messages.
+    async fn launch_prober(&self) -> Result<()> {
+        let interval: Duration = self.inner.config.base_probing_interval;
+        let gossipod = self.clone();
 
-        // x. FAILURE DETECTION USING PROBING
-        // 1. Pick a node at random using round-robin 
-        // 2. Send a PING message to the node
-        // 3. If Received, Node send back an ACK message
-        // 4. If Failed, Pick random nodes and send an INDIRECT PING-REQ for INDIRECT ACK to it specifying the target node for the request
-        // 5. If Success, Do Nothing
-        // 6. If Failed, Mark The node as suspicious, When a state change , disseminate message to a random node, till its propagated
-        // 7. If suspicious is indeed dead, it is kicked out of the membership list
-        // 8. If Not, the node will have to refute it and is alive state will be re-instated
-        // 9. End
-        // Perform probing action
-
-        // x.INFORMATION DISSEMINATION THROUGH GOSSIPING && PIGGYBACKING ON PING & PING-REQ
-
-        // Basically we have:
-        // PROBING: For detecting failure
-        // GOSSIPING: For disseminating node state change in one node targeting x randomly selected nodes
-        tokio::spawn(async move {
-            info!("Starting adaptive prober");
-
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => {
-                        info!("Received shutdown signal, stopping scheduler");
-                        break;
-                    }
-                    _ = async {
-                        if !gossipod.is_running().await {
-                            info!("Gossipod is no longer running, stopping prober");
+        // Spawn a recurrent actor for probing
+        self.runtime().spawn_recurrent_actor(
+            ActorId::ProbeActor,
+            interval,
+            move || {
+                let gossipod_clone = gossipod.clone();
+                Box::pin(
+                    async move {
+                        if !gossipod_clone.is_running().await {
+                            debug!("Gossipod is no longer running, stopping prober");
                             return;
                         }
-
-                        if backoff.is_circuit_open().unwrap_or(false)  {
-                            warn!("Circuit is open. Waiting before next probe attempt.");
-                            time::sleep(backoff.reset_timeout).await;
-                            return;
-                        }
-                        // NOTE: The probing mechanism relies on timeouts to detect node failures, which may not always be reliable.
-                        // Datagrams (UDP) are inherently unreliable, making it difficult to ascertain if a response was lost in transit or if
-                        // the node is genuinely down. To mitigate this, we're using an adaptive timeout deadline based on network type, 
-                        // assuming that WANs typically have longer delays than LANs. However, this approach may still lead to false 
-                        // positives, particularly in cases where a node is momentarily unresponsive due to factors like garbage collection (GC)
-                        // or heavy load.
-                        match gossipod.probe().await {
+                        match gossipod_clone.probe().await {
                             Ok(_) => {
-                                debug!(
-                                    "{}", 
-                                    pretty_debug("Membership:", &gossipod.inner.members.get_all_nodes().unwrap()),
-                                );
-
-                                debug!("Probe completed successfully");
-                                let _ = backoff.record_success();
-                            }
-                            Err(e) => {
-                                error!("Probe error: {}", e);
-                                if let Ok((failures, circuit_opened)) = backoff.record_failure(){
-                                    if circuit_opened {
-                                        warn!("Circuit breaker opened after {} consecutive failures", failures);
-                                    }
+                                debug!("Probe cycle completed successfully");
+                                if let Ok(nodes) = gossipod_clone.inner.members.get_all_nodes() {
+                                    debug!("{}", pretty_debug("Membership:", &nodes));
                                 }
-                            }
+                            },
+                            Err(e) => error!("Probe error: {}", e),
                         }
-
-                        let backoff_delay = backoff.calculate_delay();
-                        let size_based_delay = if let Ok(member_count) = gossipod.inner.members.len() {
-                            gossipod.inner.config.calculate_interval(
-                                gossipod.inner.config.base_probing_interval,
-                                member_count,
-                            )
-                        } else {
-                            backoff_delay
-                        };
-
-                        let final_delay = std::cmp::max(backoff_delay, size_based_delay);
-                        debug!("Waiting for {:?} before next probe", final_delay);
-                        time::sleep(final_delay).await;
-                    } => {}
-                }
+                    }
+                )
             }
-
-            gossipod.stop().await?;
-            Ok(())
-        })
+        ).await
     }
 
-    pub(crate) fn launch_event_scheduler(&self, mut shutdown_rx: broadcast::Receiver<()>) -> tokio::task::JoinHandle<Result<()>> {
+    async fn launch_gossiper(&self) -> Result<()> {
+        let interval: Duration = self.inner.config.base_probing_interval;
+        let gossipod = self.clone();
+        
+        self.runtime().spawn_recurrent_actor(
+            ActorId::GossipActor,
+            interval,
+            move || {
+                let gossipod_clone = gossipod.clone();
+                Box::pin(
+                    async move {
+                        if !gossipod_clone.is_running().await {
+                            info!("Gossipod is no longer running, stopping gossip scheduler");
+                            return;
+                        }
+        
+                        match gossipod_clone.gossip().await {
+                            Ok(_) => debug!("Gossip cycle completed successfully"),
+                            Err(e) => error!("Gossip error: {}", e),
+                        }
+                    }
+                )
+            }
+        ).await
+    }
+
+    pub(crate) async fn launch_event_scheduler(&self) -> Result<()> {
         let gossipod = self.clone();
         let scheduler_event_stream = EventStream::new(self.inner.event_scheduler.clone());
-        tokio::spawn(async move {
-            let mut event_stream = pin!(scheduler_event_stream);
-            loop {
-                tokio::select! {
-                    event = poll_fn(|cx| event_stream.as_mut().poll_next(cx)) => {
-                        debug!("====== Poll: Event Stream =========");
-                        if let Some(current_event) = event {
-                            match current_event.get_state() {
+       
+        self.runtime().spawn_actor_on_stream(
+            ActorId::EventSchedulerActor,
+            scheduler_event_stream,
+            move |command| {
+                let gossipod = gossipod.clone();
+                Box::pin(async move {
+                    match command {
+                        GossipodCommand::EventScheduler(event) => {
+                            match event.get_state() {
                                 EventState::ReachedDeadline => {
-                                    match &current_event.event_type {
+                                    match &event.event_type {
                                         EventType::Ack { sequence_number } => {
-                                            debug!("Ack with sequence number {} TIMED OUT", sequence_number);
-                                            let _ = current_event.sender.try_send(current_event.get_state());
+                                            debug!("Ack with sequence number {} timed out", sequence_number);
+                                            let _ = event.sender.try_send(event.get_state());
                                         },
                                         EventType::SuspectTimeout { node } => {
-                                            debug!("Moving Node {} to DEAD state", node);
+                                            debug!("moving node {} to `DEAD` state", node);
                                             if let Ok(Some(node)) = gossipod.inner.members.get_node(&node) {
                                                 if node.is_suspect() {
-                                                    if let Err(e)= gossipod.confirm_node_dead(&node).await {
+                                                    if let Err(e) = gossipod.confirm_node_dead(&node).await {
                                                         warn!("unable to confirm dead for node: {} because of: {}", node.name, e);
-                                                    }else {
-                                                        info!("Successfully Moved node {} to DEAD state", node.name);
+                                                    } else {
+                                                        debug!("Successfully moved node {} to DEAD state", node.name);
                                                     }
-                                        
                                                 }
                                             };
                                         },
                                     }
                                 }
-                                _ => {
-                                    // Event was intercepted or cancelled, no action needed
-                                }
+                                _ => {{/* Event was intercepted or cancelled, so no action needed here. */}}
                             }
                             // Ensure to remove event.
-                            gossipod.inner.event_scheduler.remove_event(&current_event).await;
+                            gossipod.inner.event_scheduler.remove_event(&event).await;
                         }
                     }
-                    _ = shutdown_rx.recv() => {
-                        info!("[RECV] Scheduler shutting down");
-                        break;
-                    }
-                }
+                })
             }
-            Ok(())
-        })
+        ).await
     }
 
-    fn launch_gossip_scheduler(&self, mut shutdown_rx: broadcast::Receiver<()>) -> tokio::task::JoinHandle<Result<()>> {
-        let gossipod = Arc::new(self.clone());
-        let backoff = Arc::new(BackOff::new());
-        
-        tokio::spawn(async move {
-            info!("Starting gossip scheduler");
-
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => {
-                        info!("Received shutdown signal, stopping gossip scheduler");
-                        break;
-                    }
-                    _ = async {
-                        if !gossipod.is_running().await {
-                            info!("Gossipod is no longer running, stopping gossip scheduler");
-                            return;
-                        }
-
-                        if backoff.is_circuit_open().unwrap_or(false) {
-                            warn!("Circuit is open. Waiting before next gossip attempt.");
-                            time::sleep(backoff.reset_timeout).await;
-                            return;
-                        }
-
-                        match gossipod.gossip().await {
-                            Ok(_) => {
-                                
-                                if let Ok(len) = gossipod.inner.broadcasts.len() {
-                                    debug!("Gossip completed successfully, messages left: {}", len);
-                                }
-                                let _ = backoff.record_success();
-                            }
-                            Err(e) => {
-                                error!("Gossip error: {}", e);
-                                if let Ok((failures, circuit_opened)) = backoff.record_failure(){
-                                    if circuit_opened {
-                                        warn!("Circuit breaker opened after {} consecutive failures", failures);
-                                    }
-                                }
-                            }
-                        }
-
-                        let backoff_delay = backoff.calculate_delay();
-                        let size_based_delay = if let Ok(member_count) = gossipod.inner.members.len() {
-                            gossipod.inner.config.calculate_interval(
-                                gossipod.inner.config.base_probing_interval,
-                                member_count,
-                            )
-                        } else {
-                            backoff_delay
-                        };
-
-                        let final_delay = std::cmp::max(backoff_delay, size_based_delay);
-                        debug!("Waiting for {:?} before next gossip", final_delay);
-                        time::sleep(final_delay).await;
-                    } => {}
-                }
-            }
-
-            Ok(())
-        })
+    fn runtime(&self) -> Arc<GossipodRuntime> {
+        return self.inner.runtime.clone();
     }
     
     /// Generate the next sequence number for message ordering.
@@ -886,11 +802,11 @@ where
         match message_payload {
             MessagePayload::Ping(payload) => {
                 let this = self.clone();
-                tokio::spawn(async move {
+                self.runtime().execute_now(async move {
                     if let Err(e) = this.send_ack(sender, payload.sequence_number).await {
                         error!("Failed to send ACK: {}", e);
                     }
-                });
+                }).await?;
 
                 if !payload.piggybacked_updates.is_empty() {
                     let this = self.clone();
