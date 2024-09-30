@@ -221,30 +221,30 @@ impl GossipodConfigBuilder {
     }
 
     /// Sets the name of the node
-    pub fn name(mut self, name: impl Into<String>) -> Self {
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
     /// Sets the port number for the node
-    pub fn port(mut self, port: u16) -> Self {
+    pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
 
     /// Sets the IP address for the node
-    pub fn addr(mut self, addr: impl Into<IpAddress>) -> Self {
+    pub fn with_addr(mut self, addr: impl Into<IpAddress>) -> Self {
         self.ip_addr = addr.into().0;
         self
     }
 
     /// Sets initial cluster size
-    pub fn cluster_size(mut self, cluster_size: usize) -> Self {
+    pub fn with_cluster_size(mut self, cluster_size: usize) -> Self {
         self.initial_cluster_size = cluster_size;
         self
     }
 
-    pub fn disable_tcp(mut self, disable: bool) -> Self {
+    pub fn with_tcp_enabled(mut self, disable: bool) -> Self {
         self.disable_tcp = disable;
         self
     }
@@ -253,21 +253,21 @@ impl GossipodConfigBuilder {
     ///
     /// This is the starting point for calculating the actual probing interval,
     /// which will be adjusted based on cluster size and network type.
-    pub fn probing_interval(mut self, interval: Duration) -> Self {
+    pub fn with_probing_interval(mut self, interval: Duration) -> Self {
         self.base_probing_interval = interval;
         self
     }
 
     /// Sets the time window for gossiping about supposedly dead nodes.
     /// This window allows potentially alive nodes to refute their dead status.
-    pub fn dead_node_gossip_window(mut self, window: Duration) -> Self {
+    pub fn with_dead_node_gossip_window(mut self, window: Duration) -> Self {
         self.dead_node_gossip_window = window;
         self
     }
     /// Sets the ACK timeout
     ///
     /// This is a fixed timeout used when waiting for an ACK after sending a direct probe.
-    pub fn ack_timeout(mut self, timeout: Duration) -> Self {
+    pub fn with_ack_timeout(mut self, timeout: Duration) -> Self {
         self.ack_timeout = timeout;
         self
     }
@@ -275,7 +275,7 @@ impl GossipodConfigBuilder {
     /// Sets the indirect ACK timeout
     ///
     /// This is a fixed timeout used when waiting for an ACK after sending an indirect probe.
-    pub fn indirect_ack_timeout(mut self, timeout: Duration) -> Self {
+    pub fn with_indirect_ack_timeout(mut self, timeout: Duration) -> Self {
         self.indirect_ack_timeout = timeout;
         self
     }
@@ -284,7 +284,7 @@ impl GossipodConfigBuilder {
     ///
     /// This is the starting point for calculating the actual suspicious timeout,
     /// which will be adjusted based on cluster size.
-    pub fn suspicious_timeout(mut self, timeout: Duration) -> Self {
+    pub fn with_suspicious_timeout(mut self, timeout: Duration) -> Self {
         self.base_suspicious_timeout = timeout;
         self
     }
@@ -293,7 +293,7 @@ impl GossipodConfigBuilder {
     /// Sets the network type (Local, LAN, or WAN)
     ///
     /// This affects various timing calculations, particularly the probing interval.
-    pub fn network_type(mut self, network_type: NetworkType) -> Self {
+    pub fn with_network_type(mut self, network_type: NetworkType) -> Self {
         self.network_type = network_type;
         self
     }

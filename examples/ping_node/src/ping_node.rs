@@ -73,14 +73,14 @@ impl<M: NodeMetadata> DispatchEventHandler<M> for EventHandler {
 impl SwimNode {
     async fn new(args: &Args) -> Result<Self> {
         let config = GossipodConfigBuilder::new()
-            .name(&args.name)
-            .port(args.port)
-            .addr(args.ip.parse::<Ipv4Addr>().expect("Invalid IP address"))
-            .probing_interval(Duration::from_secs(5))
-            .ack_timeout(Duration::from_millis(500))
-            .indirect_ack_timeout(Duration::from_secs(1))
-            .suspicious_timeout(Duration::from_secs(5))
-            .network_type(NetworkType::Local)
+            .with_name(&args.name)
+            .with_port(args.port)
+            .with_addr(args.ip.parse::<Ipv4Addr>().expect("Invalid IP address"))
+            .with_probing_interval(Duration::from_secs(5))
+            .with_ack_timeout(Duration::from_millis(500))
+            .with_indirect_ack_timeout(Duration::from_secs(1))
+            .with_suspicious_timeout(Duration::from_secs(5))
+            .with_network_type(NetworkType::Local)
             .build()
             .await?;
 

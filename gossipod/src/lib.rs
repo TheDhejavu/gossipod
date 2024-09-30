@@ -1714,9 +1714,9 @@ mod tests {
 
     async fn create_test_gossipod(name: &str, port: u16) -> Result<(Gossipod<DefaultMetadata>, Arc<MockDatagramTransport>)> {
         let config = GossipodConfigBuilder::new()
-            .name(name.to_string())
-            .port(port)
-            .disable_tcp(true)
+            .with_name(name.to_string())
+            .with_port(port)
+            .with_tcp_enabled(true)
             .build()
             .await?;
 
