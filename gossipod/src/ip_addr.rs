@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn test_from_ipaddr() {
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let ip_address = ip.into();
+        let ip_address = IpAddress::from(ip);
         assert_eq!(ip_address.0, ip);
     }
 
